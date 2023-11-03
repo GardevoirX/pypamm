@@ -1,10 +1,16 @@
 import os
+import warnings
 import numpy as np
 from skmatter.feature_selection import FPS
 from scipy.spatial.distance import cdist
+from sklearn.covariance import OAS
 from typing import Optional
 
 def read_period(period_text):
+
+    if period_text is None:
+        return None
+
     period = []
     for num in period_text.split(','):
         period.append(eval(num))
@@ -19,28 +25,59 @@ def pammr2(period, xi, xj):
         xij[d] = xij[d] - round(xij[d]/p) * p
     return np.sum(xij**2)
 
-def covariance(dimension: int, x: np.ndarray, period: np.ndarray,
+def covariance(grid_pos: np.ndarray, period: np.ndarray,
                grid_weight: np.ndarray, totw: float):
 
+    nsample = grid_pos.shape[0]
+    dimension = grid_pos.shape[1]
     xm = np.zeros(dimension)
-    xxm = np.zeros((dimension, len(x)))
-    xxmw = np.zeros((dimension, len(x)))
+    xxm = np.zeros((nsample, dimension))
+    xxmw = np.zeros((nsample, dimension))
     for i in range(dimension):
         if period[i] > 0:
-            sumsin = np.sum(grid_weight * np.sim(x[i, :]) *\
+            sumsin = np.sum(grid_weight * np.sim(grid_pos[:, i]) *\
                             (2 * np.pi) / period[i]) / totw
-            sumcos = np.sum(grid_weight * np.sim(x[i, :]) *\
+            sumcos = np.sum(grid_weight * np.sim(grid_pos[:, i]) *\
                             (2 * np.pi) / period[i]) / totw
             xm[i] = np.arctan2(sumsin, sumcos)
         else:
-            xm[i] = np.sum(x[i, :] * w) / wnorm
-        xxm[i, :] = x[i, :] - xm[i]
+            xm[i] = np.sum(grid_pos[:, i] * grid_weight) / totw
+        xxm[:, i] = grid_pos[:, i] - xm[i]
         if period[i] > 0:
-            xxm[i, :] -= round(xxm[i, :] / period[i]) * period[i]
-        xxmw[i, :] = xxm[i, :] * grid_weight /totw
-        
+            xxm[:, i] -= round(xxm[:, i] / period[i]) * period[i]
+        xxmw[:, i] = xxm[:, i] * grid_weight /totw
+    
+        cov = xxm.dot(xxmw.T)
+        cov /= 1 - sum(grid_weight / totw) ** 2
 
-    return
+    return cov
+
+def effdim(cov):
+
+    eigval = np.linalg.eigvals(cov)
+    eigval /= sum(eigval)
+    eigval *= np.log(eigval)
+    eigval[np.isnan(eigval)] = 0.
+    
+    return np.exp(-sum(eigval))
+
+def localization(period, x: np.ndarray, y: np.ndarray, grid_weight: np.ndarray, s2: float):
+
+    dimension = len(period)
+    xy = np.zeros(x.shape)
+    for i in range(dimension):
+        if period[i] <= 0: continue
+        # scaled length
+        xy[i, :] = x[i, :] - y[i]
+        # Finds the smallest separation between the images of the vector elements
+        xy[i, :] -= round(xy[i, :])
+        # Rescale back the length
+        xy[i, :] *= period[i]
+    wl = np.exp(-0.5 / s2 * np.sum(xy**2, axis=0)) * grid_weight
+    num = np.sum(wl)
+
+    return wl, num
+
 
 class PAMM:
     def __init__(self, dimension, alpha:float = 1., 
@@ -78,7 +115,6 @@ class PAMM:
         self.weighted = weighted
         self.verbose = verbose
 
-
         if self.qs < 0:
             raise ValueError('The QS scaling should be positive')
         if self.bootstrap < 0:
@@ -90,11 +126,17 @@ class PAMM:
 
         self.nsamples, self.descriptor, self.weight, self.totw = \
             self._read_descriptor_and_weights(descriptorfile)
+        if self.ngrid == -1:
+        # If not specified, the number of voronoi polyhedra
+        # are set to the square root of the total number of points
+            self.ngrid = int(np.sqrt(self.nsamples))
+        self.local_dimension = np.zeros(self.ngrid)
         self.weight /= self.totw
         if self.gridfile:
             igrid = self.from_gridfile()
         else:
             igrid = self.cal_grid()
+        self.grid_pos = self.descriptor[igrid]
         self.grid_npoints, self.grid_weight = self.clustering(igrid)
         dist_matrix = self.get_grid_dist_matrix(igrid)
         gabriel = self.get_gabriel_graph(dist_matrix)
@@ -132,11 +174,6 @@ class PAMM:
             weight = content[:, -1]
         totw = np.sum(weight)
         weight /= totw
-
-        if self.ngrid == -1:
-        # If not specified, the number of voronoi polyhedra
-        # are set to the square root of the total number of points
-            self.ngrid = int(np.sqrt(nsamples))
         
         return nsamples, descriptor, weight, totw
     
@@ -217,10 +254,81 @@ class PAMM:
                     print(' '.join(gabriel[i, :]))
         return gabriel
     
-    def computes_localization(self):
+    def computes_localization(self, igrid: np.ndarray, mindist: np.ndarray):
         delta = 1 / self.nsamples
         # only one of the methods can be used at a time
         if self.fspread > 0:
             self.fpoints = -1.
+        cov = covariance(self.grid_pos, self.period, self.grid_weight, 1.0)
+        print(f'Global eff. dim. {effdim(cov)}')
 
+        if self.period is not None:
+            tune = sum(self.period ** 2)
+        else:
+            tune = np.trace(cov)
+        sigma2 = tune
+
+        # initialize the localization based on fraction of data spread
+        if self.fspread > 0:
+            sigma2 *= self.fspread ** 2
+        if self.verbose:
+            print('Estimating kernel density bandwidths')
+        flocal = np.zeros(self.ngrid)
+        for i in range(self.ngrid):
+            if self.verbose and (i % 100 == 0):
+                print(f'  {i} / {self.ngrid}')
+            wlocal, flocal[i] = localization(self.period, self.descriptor, self.descriptor[igrid[i]], self.grid_weight, sigma2[i])
+            if self.fpoints > 0:
+                sigma2, flocal = self._localization_based_on_fraction_of_points(sigma2, flocal, i, delta, tune, igrid)
+            else:
+                sigma2, flocal = self._localization_based_on_fraction_of_spread(sigma2, flocal, i, mindist, igrid)
+            self._bandwidth_esitimation_from_localization()
+
+        qscut2 *= self.qs ** 2
         return
+    
+    def _localization_based_on_fraction_of_points(self, sigma2, flocal, idx, delta, tune, igrid):
+
+        lim = self.fpoints
+        if lim <= self.grid_weight[idx]:
+            lim = self.grid_weight[idx] + delta
+            warnings.warn(" Warning: localization smaller than voronoi, increase grid size (meanwhile adjusted localization)!")
+        while flocal[idx] < lim:
+            sigma2[idx] += tune
+            wlocal, flocal[idx] = localization(self.period, self.descriptor, self.descriptor[igrid[idx]], self.grid_weight, sigma2[idx])
+        j = 1
+        while True:
+            if flocal[idx] > lim:
+                sigma2[idx] -= tune / 2 ** j
+            else:
+                sigma2[idx] += tune / 2 ** j
+            wlocal, flocal[idx] = localization(self.period, self.descriptor, self.descriptor[igrid[idx]], self.grid_weight, sigma2[idx])
+            if abs(flocal[idx] - lim) < delta:
+                break
+            j += 1
+
+        return sigma2, flocal
+    
+    def _location_based_on_fraction_of_spread(self, sigma2, flocal, idx, mindist, igrid):
+        
+        if sigma2[idx] < mindist[idx]:
+            sigma2[idx] = mindist[idx]
+            wlocal, flocal[idx] = localization(self.period, self.descriptor, self.descriptor[igrid[idx]], self.grid_weight, sigma2[idx])
+
+        return sigma2, flocal
+    
+    def _bandwidth_estimation_from_localization(self, wlocal, flocal, idx, ):
+
+        cov_i = covariance(self.grid_pos, self.period, wlocal, flocal[idx])
+        nlocal = flocal[idx] * self.nsamples
+        self.local_dimension[idx] = effdim(cov_i)
+        cov_i = OAS().fit(cov_i).covariance_
+        cov_i_inv = np.linalg.inv(cov_i)
+        h = (4. / (self.local_dimension[idx] + 2.)) ** (2. / (self.local_dimension[idx] + 4.)) * nlocal ** (-2. / (self.local_dimension[idx] + 4.)) * cov_i
+        h_inv[idx] = np.linalg.inv(h)
+        logdet_h[idx] = np.linalg.slogdet(h)[1]
+        normkernel[idx] = self.deminsion * 2 * np.pi + logdet_h[idx]
+        qscut2[idx] = np.trace(cov_i)
+
+        return 
+
