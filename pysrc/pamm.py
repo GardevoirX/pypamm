@@ -148,11 +148,17 @@ def mahalanobis(period: np.ndarray, x: np.ndarray, y: np.ndarray, cov_inv: np.nd
 
     """
 
-    x = x[np.newaxis, :]
-    xy = np.zeros(x.shape, dtype=float)
-    xy = pammrij(period, xy, x, y)[0]
-    tmpv = xy.dot(cov_inv)
-    xcx = xy.dot(tmpv)
+    if len(x.shape) == 1:
+        x = x[np.newaxis, :]
+    if len(cov_inv.shape) == 2:
+        cov_inv = cov_inv[np.newaxis, :, :]
+    xy = np.zeros(x.shape)
+    xy = pammrij(period, xy, x, y)
+    if cov_inv.shape[0] == 1:
+        tmpv = xy.dot(cov_inv[0])
+    else:
+        tmpv = np.array([xy[i].dot(cov_inv[i]) for i in range(x.shape[0])])
+    xcx = np.array([xy[i].dot(tmpv[i].T) for i in range(x.shape[0])])
 
     return xcx
 
@@ -215,11 +221,9 @@ class PAMM:
             igrid = self.cal_grid()
         self.grid_pos = self.descriptor[igrid]
         self.grid_npoints, self.grid_weight, grid_neighbour = self.clustering()
-        print(grid_neighbour[1])
         dist_matrix = self.get_grid_dist_matrix()
         gabriel = self.get_gabriel_graph(dist_matrix)
         h_invs, normkernels, qscut2 = self.computes_localization(igrid, dist_matrix)
-        print(self.totw)
         prob = self.computes_kernel_density_estimation(h_invs, normkernels, igrid, grid_neighbour)
         return prob
         
@@ -271,7 +275,6 @@ class PAMM:
             print(f'Selecting: {self.ngrid} points using MINMAX')
         fps = FPS(n_to_select=self.ngrid)
         fps.fit(self.descriptor.T)
-        #grid = fps.transform(self.descriptor.T)
         igrid = fps.selected_idx_
 
         return igrid
@@ -295,6 +298,9 @@ class PAMM:
         assert np.sum(grid_weight == 0) == 0, \
             "Error: voronoi has no points associated with" \
             "- probably two points are perfectly overlapping"
+
+        for key in grid_neighbour:
+            grid_neighbour[key] = np.array(grid_neighbour[key])
 
         return grid_npoints, grid_weight, grid_neighbour
     
@@ -421,33 +427,37 @@ class PAMM:
             print('Computing kernel density on reference points')
         d = self.descriptor.shape[1]
         kdecut2 = 9 * (np.sqrt(d) + 1) ** 2
-        print(kdecut2)
         prob = np.full(self.ngrid, -np.inf)
         for i in range(self.ngrid):
             if self.verbose and (i % 100 == 0):
                 print(f'  {i} / {self.ngrid}')
-            for j in range(self.ngrid):
-                dummd1 = mahalanobis(self.period, self.grid_pos[i], self.grid_pos[j], h_inv[j])
-                if (i==0) and (j==1):
-                    print(dummd1)
+                dummd1s = mahalanobis(self.period, self.grid_pos, self.grid_pos[i], h_inv)
+            for j, dummd1 in enumerate(dummd1s):
                 if dummd1 > kdecut2:
                     lnk = -0.5 * (normkernel[j] + dummd1) + np.log(self.grid_weight[j])
-                    if prob[i] > lnk:
-                        prob[i] = prob[i] + np.log(1 + np.exp(lnk - prob[i]))
-                    else:
-                        prob[i] = lnk + np.log(1 + np.exp(prob[i] - lnk))
+                    prob[i] = _update_prob(prob[i], lnk)
                 else:
-                    for k in neighbour[j]:
-                        if k == igrid[i]:
-                            continue
-                        dummd1 = mahalanobis(self.period, self.grid_pos[i], self.descriptor[k], h_inv[j])
-                        lnk = -0.5 * (normkernel[j] + dummd1) + np.log(self.weight[k])
-                        if prob[i] > lnk:
-                            prob[i] = prob[i] + np.log(1 + np.exp(lnk - prob[i]))
-                        else:
-                            prob[i] = lnk + np.log(1 + np.exp(prob[i] - lnk))
-                if (i==0):
-                    print(f'{j}: {prob[i]}')
+                    neighbours = neighbour[j][neighbour[j] != igrid[i]]
+                    dummd1s = mahalanobis(self.period, self.descriptor[neighbours], self.grid_pos[i], h_inv[j])
+                    lnks = -0.5 * (normkernel[j] + dummd1s) + np.log(self.weight[neighbours])
+                    prob[i] = _update_probs(prob[i], lnks)
+
         prob -= np.log(self.totw)
 
         return prob
+    
+@jit(nopython=True)
+def _update_probs(prob_i: float, lnks: np.ndarray):
+
+    for lnk in lnks:
+        prob_i = _update_prob(prob_i, lnk)
+
+    return prob_i
+
+@jit(nopython=True)
+def _update_prob(prob_i: float, lnk: float):
+
+    if prob_i > lnk:
+        return prob_i + np.log(1 + np.exp(lnk - prob_i))
+    else:
+            return lnk + np.log(1 + np.exp(prob_i - lnk))
