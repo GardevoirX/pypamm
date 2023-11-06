@@ -2,6 +2,7 @@ import os
 import warnings
 import numpy as np
 from numba import jit
+from scipy.special import logsumexp as LSE
 from skmatter.feature_selection import FPS
 from typing import Optional
 from pysrc.utils.dist import pammr2, mahalanobis
@@ -112,6 +113,28 @@ def oas(cov, n, D):
     
     return (1 - phi) * cov + np.diag([phi * tr /D for i in range(D)])
 
+def logsumexp(v1: np.ndarray, probs: np.ndarray, clusterid: int):
+
+    ngrid = probs.shape[0]
+    tmpv = np.copy(probs)
+    tmpv[v1 != clusterid] = -np.inf
+    logsumexp = -np.inf
+    for i in range(ngrid):
+        if probs[i] == -np.inf:
+            continue
+        if logsumexp > tmpv[i]:
+            logsumexp += np.log(1 + np.exp(tmpv[i] - logsumexp))
+        else:
+            logsumexp = tmpv[i] + np.log(1 + np.exp(logsumexp - tmpv[i]))
+
+    return logsumexp
+
+def getidmax(v1: np.ndarray, probs: np.ndarray, clusterid: int):
+    
+    tmpv = np.copy(probs)
+    tmpv[v1 != clusterid] = -np.inf
+    return np.argmax(tmpv)
+
 
 class PAMM:
     def __init__(self, dimension, alpha:float = 1., 
@@ -165,6 +188,8 @@ class PAMM:
         # If not specified, the number of voronoi polyhedra
         # are set to the square root of the total number of points
             self.ngrid = int(np.sqrt(self.nsamples))
+        self.pabserr = np.full(self.ngrid, np.inf)
+        self.prelerr = np.full(self.ngrid, np.inf)
         self.local_dimension = np.zeros(self.ngrid)
         if self.gridfile:
             igrid = self.from_gridfile()
@@ -175,9 +200,15 @@ class PAMM:
         dist_matrix = self.get_grid_dist_matrix()
         idmindist = np.argmin(dist_matrix, axis=1)
         self.gabriel = self.get_gabriel_graph(dist_matrix)
-        h_invs, normkernels, qscut2 = self.computes_localization(igrid, dist_matrix)
-        prob = self.computes_kernel_density_estimation(h_invs, normkernels, igrid, self.grid_neighbour)
-        cluster_centers = self.quick_shift(prob, dist_matrix, idmindist, qscut2)
+        h_invs, normkernels, qscut2, self.sigma2, self.flocal = \
+            self.computes_localization(igrid, dist_matrix)
+        self.probs = \
+            self.computes_kernel_density_estimation(h_invs, normkernels, 
+                                                    igrid, self.grid_neighbour)
+        cluster_centers, idxroot = \
+            self.quick_shift(self.probs, dist_matrix, idmindist, qscut2)
+        cluster_centers, idxroot = \
+            self.post_process(cluster_centers, idxroot, self.probs)
 
         return cluster_centers
         
@@ -313,6 +344,7 @@ class PAMM:
         h_invs = np.zeros((self.ngrid, ndescriptor, ndescriptor))
         normkernels = np.zeros(self.ngrid)
         qscut2 = np.zeros(self.ngrid)
+        h_tr_normed = np.zeros(self.ngrid)
         for i in range(self.ngrid):
             if self.verbose and (i % 100 == 0):
                 print(f'  {i} / {self.ngrid}')
@@ -321,12 +353,12 @@ class PAMM:
                 sigma2, flocal, wlocal = self._localization_based_on_fraction_of_points(sigma2, flocal, i, delta, tune)
             else:
                 sigma2, flocal, wlocal = self._localization_based_on_fraction_of_spread(sigma2, flocal, i, mindist)
-            h_invs[i], normkernels[i], qscut2[i] = \
-                self._bandwidth_estimation_from_localization(wlocal, flocal, i, )
+            h_invs[i], normkernels[i], qscut2[i], h_tr_normed[i] = \
+                self._bandwidth_estimation_from_localization(wlocal, flocal, i)
 
         qscut2 *= self.qs ** 2
 
-        return h_invs, normkernels, qscut2
+        return h_invs, normkernels, qscut2, sigma2, flocal
     
     def _localization_based_on_fraction_of_points(self, sigma2, flocal, idx, delta, tune):
 
@@ -366,13 +398,14 @@ class PAMM:
         cov_i = oas(cov_i, nlocal, self.descriptor.shape[1])
         # cov_i_inv = np.linalg.inv(cov_i)
         h = (4. / (self.local_dimension[idx] + 2.)) ** (2. / (self.local_dimension[idx] + 4.)) * nlocal ** (-2. / (self.local_dimension[idx] + 4.)) * cov_i
+        h_tr_normed = np.trace(h) / h.shape[0]
         h_inv = np.linalg.inv(h)
         sign, det = np.linalg.slogdet(h)
         logdet_h = det
         normkernel = self.dimension * np.log(2 * np.pi) + logdet_h
         qscut2 = np.trace(cov_i)
 
-        return  h_inv, normkernel, qscut2
+        return  h_inv, normkernel, qscut2, h_tr_normed
     
     def computes_kernel_density_estimation(self, h_inv: np.ndarray, normkernel: np.ndarray, igrid: np.ndarray, neighbour: dict):
 
@@ -425,8 +458,6 @@ class PAMM:
                     break
                 counter += 1
                 qspath[counter] = idxroot[qspath[counter - 1]]
-            if i == 0:
-                print(qspath)
                 
             for j in range(counter):
                 idxroot[qspath[j]] = idxroot[idxroot[qspath[counter]]]
@@ -434,7 +465,7 @@ class PAMM:
 
         return cluster_centers, idxroot
     
-    def gs_next(self, idx:int, probs: np.ndarray, n_shells: int, distmm: np.ndarray):
+    def gs_next(self, idx: int, probs: np.ndarray, n_shells: int, distmm: np.ndarray):
 
         neighs = np.copy(self.gabriel[idx])
         for i in range(1, n_shells):
@@ -468,8 +499,44 @@ class PAMM:
                 dmin = distmm[idx, j]
 
         return qs_next
+    
+    def post_process(self, cluster_centers: np.ndarray, idxroot: np.ndarray, probs: np.ndarray):
 
+        nk = len(cluster_centers)
+        to_merge = np.full(nk, False)
+        normpks = logsumexp(idxroot, probs, 1)
+        for k in range(nk):
+            dummd1 = np.exp(logsumexp(idxroot, probs, cluster_centers[k]) - normpks)
+            to_merge[k] = dummd1 > self.thrpcl
+        # merge the outliers
+        for i in range(nk):
+            if not to_merge[k]:
+                continue
+            dummd1yi1 = cluster_centers[i]
+            dummd1 = np.inf
+            for j in range(nk):
+                if to_merge[k]:
+                    continue
+                dummd2 = pammr2(self.period, 
+                                self.grid_pos[idxroot[dummd1yi1]], 
+                                self.grid_pos[idxroot[j]])
+                if dummd2 < dummd1:
+                    dummd1 = dummd2
+                    cluster_centers[i] = j
+            idxroot[idxroot == dummd1yi1] = cluster_centers[i]
+        if sum(to_merge) > 0:
+            cluster_centers = np.concatenate(np.argwhere(idxroot == np.arange(self.ngrid)))
+            if self.verbose:
+                print(f'Nk-{len(cluster_centers)} clusters were merged'
+                      f'into other clusters.')
+            nk = len(cluster_centers)
+            for i in range(nk):
+                dummd1yi1 = cluster_centers[i]
+                cluster_centers[i] = getidmax(idxroot, probs, cluster_centers[i])
+                idxroot[idxroot == dummd1yi1] = cluster_centers[i]
         
+        return cluster_centers, idxroot
+
     def bootstrap(self, nbootstrap: int):
         
         prob_boot = np.full((nbootstrap, self.ngrid), -np.inf)
@@ -495,6 +562,23 @@ class PAMM:
                         dummd1s = mahalanobis(self.period, self.descriptor[idx], self.grid_pos[i], self.h_inv[j])
                         lnks = -0.5 * (self.normkernel[j] + dummd1s) + np.log(self.weight[idx])
                         prob_boot[n, i] = _update_probs(prob_boot[n, i], lnks)
+
+    def get_output(self, outputfile: str):
+
+        nfeature = self.descriptor.shape[1]
+        with open(outputfile, 'w') as wfl:
+            for i in range(self.ngrid):
+                for j in range(nfeature):
+                    wfl.write(f'{self.grid_pos[i][j]:>15.4e}')
+                wfl.write(f'{self.probs[i]:>15.4e}')
+                wfl.write(f'{self.pabserr[i]:>15.4e}')
+                wfl.write(f'{self.prelerr[i]:>15.4e}')
+                wfl.write(f'{self.sigma2[i]:>15.4e}')
+                wfl.write(f'{self.flocal[i]:>15.4e}')
+                wfl.write(f'{self.grid_weight[i]:>15.4e}')
+                wfl.write(f'{self.local_dimension[i]:>15.4e}')
+                wfl.write(f'{self.h_tr_normed[i]:>15.4e}')
+                wfl.write('\n')
     
 @jit(nopython=True)
 def _update_probs(prob_i: float, lnks: np.ndarray):
