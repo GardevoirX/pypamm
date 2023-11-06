@@ -2,11 +2,9 @@ import os
 import warnings
 import numpy as np
 from numba import jit
-from rich.progress import track
 from skmatter.feature_selection import FPS
-from scipy.spatial.distance import cdist
-from sklearn.covariance import OAS
 from typing import Optional
+from pysrc.utils.dist import pammr2, mahalanobis
 
 def read_period(period_text):
 
@@ -20,25 +18,6 @@ def read_period(period_text):
         elif period[-1] == 3.14: period[-1] = np.pi
 
     return np.array(period)
-
-def pammr2(period, xi, xj):
-
-    if len(xi.shape) == 1:
-        xi = xi[np.newaxis, :]
-
-    xij = np.zeros(xi.shape, dtype=float)
-    xij = pammrij(period, xij, xi, xj)
-
-    return np.sum(xij**2, axis=1)
-
-@jit(nopython=True, fastmath=True)
-def pammrij(period, xij, xi, xj):
-
-    period_feature = period > 0
-    xij = xi - xj
-    xij[:, period_feature] -= np.round(xij[:, period_feature]/period[period_feature]) * period[period_feature]
-
-    return xij
 
 def covariance(grid_pos: np.ndarray, period: np.ndarray,
                grid_weight: np.ndarray, totw: float):
@@ -133,34 +112,6 @@ def oas(cov, n, D):
     
     return (1 - phi) * cov + np.diag([phi * tr /D for i in range(D)])
 
-def mahalanobis(period: np.ndarray, x: np.ndarray, y: np.ndarray, cov_inv: np.ndarray):
-    """
-    Calculates the Mahalanobis distance between two vectors.
-
-    Args:
-        period (np.ndarray): An array of periods for each dimension of the grid.
-        x (np.ndarray): An array of vectors to be localized.
-        y (np.ndarray): An array of target vectors representing the grid.
-        cov_inv (np.ndarray): The inverse of the covariance matrix.
-
-    Returns:
-        float: The Mahalanobis distance.
-
-    """
-
-    if len(x.shape) == 1:
-        x = x[np.newaxis, :]
-    if len(cov_inv.shape) == 2:
-        cov_inv = cov_inv[np.newaxis, :, :]
-    xy = np.zeros(x.shape)
-    xy = pammrij(period, xy, x, y)
-    if cov_inv.shape[0] == 1:
-        tmpv = xy.dot(cov_inv[0])
-    else:
-        tmpv = np.array([xy[i].dot(cov_inv[i]) for i in range(x.shape[0])])
-    xcx = np.array([xy[i].dot(tmpv[i].T) for i in range(x.shape[0])])
-
-    return xcx
 
 class PAMM:
     def __init__(self, dimension, alpha:float = 1., 
@@ -220,12 +171,15 @@ class PAMM:
         else:
             igrid = self.cal_grid()
         self.grid_pos = self.descriptor[igrid]
-        self.grid_npoints, self.grid_weight, grid_neighbour = self.clustering()
+        self.grid_npoints, self.grid_weight, self.grid_neighbour = self.clustering()
         dist_matrix = self.get_grid_dist_matrix()
-        gabriel = self.get_gabriel_graph(dist_matrix)
+        idmindist = np.argmin(dist_matrix, axis=1)
+        self.gabriel = self.get_gabriel_graph(dist_matrix)
         h_invs, normkernels, qscut2 = self.computes_localization(igrid, dist_matrix)
-        prob = self.computes_kernel_density_estimation(h_invs, normkernels, igrid, grid_neighbour)
-        return prob
+        prob = self.computes_kernel_density_estimation(h_invs, normkernels, igrid, self.grid_neighbour)
+        cluster_centers = self.quick_shift(prob, dist_matrix, idmindist, qscut2)
+
+        return cluster_centers
         
     def post_processing(self, clusterfile:str):
 
@@ -286,9 +240,9 @@ class PAMM:
 
         # assign samples to its cloeset grid
         dist_grid2descriptor = []
-        for descriptor in self.descriptor:
-            dist_grid2descriptor.append(pammr2(self.period, self.grid_pos, descriptor))
-        dist_grid2descriptor = np.array(dist_grid2descriptor).T
+        for grid in self.grid_pos:
+            dist_grid2descriptor.append(pammr2(self.period, self.descriptor, grid))
+        dist_grid2descriptor = np.array(dist_grid2descriptor)
         labels = np.argmin(dist_grid2descriptor, axis=0)
         for ipoint, label in enumerate(labels):
             grid_npoints[label] += 1
@@ -305,7 +259,6 @@ class PAMM:
         return grid_npoints, grid_weight, grid_neighbour
     
     def get_grid_dist_matrix(self):
-        # TODO: take PBC into consideration
         if self.verbose:
             print(" Precalculate distance matrix between grid points")
 
@@ -365,9 +318,9 @@ class PAMM:
                 print(f'  {i} / {self.ngrid}')
             wlocal, flocal[i] = localization(self.period, self.grid_pos, self.grid_pos[i], self.grid_weight, sigma2[i])
             if self.fpoints > 0:
-                sigma2, flocal, wlocal = self._localization_based_on_fraction_of_points(sigma2, flocal, i, delta, tune, igrid)
+                sigma2, flocal, wlocal = self._localization_based_on_fraction_of_points(sigma2, flocal, i, delta, tune)
             else:
-                sigma2, flocal, wlocal = self._localization_based_on_fraction_of_spread(sigma2, flocal, i, mindist, igrid)
+                sigma2, flocal, wlocal = self._localization_based_on_fraction_of_spread(sigma2, flocal, i, mindist)
             h_invs[i], normkernels[i], qscut2[i] = \
                 self._bandwidth_estimation_from_localization(wlocal, flocal, i, )
 
@@ -375,7 +328,7 @@ class PAMM:
 
         return h_invs, normkernels, qscut2
     
-    def _localization_based_on_fraction_of_points(self, sigma2, flocal, idx, delta, tune, igrid):
+    def _localization_based_on_fraction_of_points(self, sigma2, flocal, idx, delta, tune):
 
         lim = self.fpoints
         if lim <= self.grid_weight[idx]:
@@ -397,11 +350,11 @@ class PAMM:
 
         return sigma2, flocal, wlocal
     
-    def _localization_based_on_fraction_of_spread(self, sigma2, flocal, idx, mindist, igrid):
+    def _localization_based_on_fraction_of_spread(self, sigma2, flocal, idx, mindist):
         
         if sigma2[idx] < mindist[idx]:
             sigma2[idx] = mindist[idx]
-            wlocal, flocal[idx] = localization(self.period, self.descriptor, self.descriptor[igrid[idx]], self.grid_weight, sigma2[idx])
+            wlocal, flocal[idx] = localization(self.period, self.descriptor, self.grid_pos, self.grid_weight, sigma2[idx])
 
         return sigma2, flocal, wlocal
     
@@ -426,14 +379,18 @@ class PAMM:
         if self.verbose:
             print('Computing kernel density on reference points')
         d = self.descriptor.shape[1]
-        kdecut2 = 9 * (np.sqrt(d) + 1) ** 2
+        self.kdecut2 = 9 * (np.sqrt(d) + 1) ** 2
         prob = np.full(self.ngrid, -np.inf)
+        import pickle
+        #idx = pickle.load('idx.pkl')
         for i in range(self.ngrid):
             if self.verbose and (i % 100 == 0):
                 print(f'  {i} / {self.ngrid}')
-                dummd1s = mahalanobis(self.period, self.grid_pos, self.grid_pos[i], h_inv)
+            dummd1s = mahalanobis(self.period, self.grid_pos, self.grid_pos[i], h_inv)
+
             for j, dummd1 in enumerate(dummd1s):
-                if dummd1 > kdecut2:
+                
+                if dummd1 > self.kdecut2:
                     lnk = -0.5 * (normkernel[j] + dummd1) + np.log(self.grid_weight[j])
                     prob[i] = _update_prob(prob[i], lnk)
                 else:
@@ -445,6 +402,99 @@ class PAMM:
         prob -= np.log(self.totw)
 
         return prob
+    
+    def quick_shift(self, probs: np.ndarray, dist_matrix: np.ndarray, idmindist: np.ndarray, qscut2: np.ndarray):
+
+        if self.verbose:
+            print("Starting Quick-Shift")
+        idxroot = np.full(self.ngrid, -1, dtype=int)
+        for i in range(self.ngrid):
+            if idxroot[i] != -1:
+                continue
+            if self.verbose and (i % 1000 == 0):
+                print(f'  {i} / {self.ngrid}')
+            qspath = np.zeros(self.ngrid, dtype=int)
+            qspath[0] = i
+            counter = 0
+            while qspath[counter] != idxroot[qspath[counter]]:
+                if self.gs > 0:
+                    idxroot[qspath[counter]] = self.gs_next(qspath[counter], probs, self.gs, dist_matrix)
+                else:
+                    idxroot[qspath[counter]] = self.qs_next(qspath[counter], idmindist[qspath[counter]], probs, dist_matrix, qscut2[qspath[counter]])
+                if idxroot[idxroot[qspath[counter]]] != -1:
+                    break
+                counter += 1
+                qspath[counter] = idxroot[qspath[counter - 1]]
+            if i == 0:
+                print(qspath)
+                
+            for j in range(counter):
+                idxroot[qspath[j]] = idxroot[idxroot[qspath[counter]]]
+        cluster_centers = np.concatenate(np.argwhere(idxroot == np.arange(self.ngrid)))
+
+        return cluster_centers, idxroot
+    
+    def gs_next(self, idx:int, probs: np.ndarray, n_shells: int, distmm: np.ndarray):
+
+        neighs = np.copy(self.gabriel[idx])
+        for i in range(1, n_shells):
+            nneighs = np.full(self.ngrid, False)
+            for j in range(self.ngrid):
+                if neighs[j]:
+                    nneighs |= self.gabriel[j]
+            neighs |= nneighs
+        gs_next = idx
+        dmin = np.inf
+        for j in range(self.ngrid):
+            if probs[j] > probs[idx] and \
+               distmm[idx, j] < dmin and \
+               neighs[j]:
+                gs_next = j
+                dmin = distmm[idx, j]
+
+        return gs_next
+    
+    def qs_next(self, idx:int, idxn: int, probs: np.ndarray, distmm: np.ndarray, lambda_: float):
+
+        dmin = np.inf
+        qs_next = idx
+        if probs[idxn] > probs[idx]:
+            qs_next = idxn
+        for j in range(self.ngrid):
+            if probs[j] > probs[idx] and \
+               distmm[idx, j] < dmin and \
+               distmm[idx, j] < lambda_:
+                qs_next = j
+                dmin = distmm[idx, j]
+
+        return qs_next
+
+        
+    def bootstrap(self, nbootstrap: int):
+        
+        prob_boot = np.full((nbootstrap, self.ngrid), -np.inf)
+        for n in range(nbootstrap):
+            if self.verbose:
+                print(f'Bootstrap {n + 1} / {nbootstrap}')
+            n_bootsample = 0
+            for j in range(self.ngrid):
+                nsample = np.random.binomial(self.nsamples, self.grid_npoints[j] / self.nsamples)
+                if nsample == 0:
+                    continue
+                dummd2 = np.log(nsample / self.grid_npoints[j]) * \
+                    np.log(self.grid_weight[j])
+                n_bootsample += nsample
+                for i in range(self.ngrid):
+                    dummd1 = mahalanobis(self.period, self.grid_pos[i], self.grid_pos[j], self.h_inv[j])
+                    if dummd1 > self.kdecut2:
+                        lnk = -0.5 * (self.normkernel[j] + dummd1) + dummd2
+                        prob_boot[n, i] = _update_prob(prob_boot[n, i], lnk)
+                    else:
+                        select = np.random.choice(self.grid_npoints[j], nsample)
+                        idx = self.grid_neighbour[j][select]
+                        dummd1s = mahalanobis(self.period, self.descriptor[idx], self.grid_pos[i], self.h_inv[j])
+                        lnks = -0.5 * (self.normkernel[j] + dummd1s) + np.log(self.weight[idx])
+                        prob_boot[n, i] = _update_probs(prob_boot[n, i], lnks)
     
 @jit(nopython=True)
 def _update_probs(prob_i: float, lnks: np.ndarray):
@@ -460,4 +510,4 @@ def _update_prob(prob_i: float, lnk: float):
     if prob_i > lnk:
         return prob_i + np.log(1 + np.exp(lnk - prob_i))
     else:
-            return lnk + np.log(1 + np.exp(prob_i - lnk))
+        return lnk + np.log(1 + np.exp(prob_i - lnk))

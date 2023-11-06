@@ -677,7 +677,6 @@
       ! setting initial probability to the smallest possible value
       prob = -HUGE(0.0d0)
 
-
       DO i=1,ngrid
         IF(verbose .AND. (modulo(i,100).EQ.0)) &
           WRITE(*,*) i,"/",ngrid
