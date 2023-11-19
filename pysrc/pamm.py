@@ -7,10 +7,10 @@ from scipy.special import logsumexp as LSE
 from skmatter.feature_selection import FPS
 from pysrc.utils.dist import pammr2, mahalanobis
 
-def read_period(period_text):
+def read_period(period_text: str, dimension: int):
 
     if period_text is None:
-        return None
+        return np.full(dimension, -1)
 
     period = []
     for num in period_text.split(','):
@@ -135,17 +135,17 @@ def getidmax(v1: np.ndarray, probs: np.ndarray, clusterid: int):
 
 
 class PAMM:
-    def __init__(self, dimension, alpha:float = 1., 
-                 fpost:bool = False, seed:int = 12345, qs:float = 1., 
-                 nmsopt:int = 0, ngrid:int = -1, bootstrap:int = 0, 
-                 fspread:float = -1., fpoints:float = 0.15, 
+    def __init__(self, dimension, alpha:float = 1.,
+                 fpost:bool = False, seed:int = 12345, qs:float = 1.,
+                 nmsopt:int = 0, ngrid:int = -1,
+                 fspread:float = -1., fpoints:float = 0.15,
                  period_text:Optional[str]= None, zeta:float = 0.,
                  thrmerg:float = 0.8, thrpcl:float = 0., outputfile:str = 'out',
-                 savegrid:bool = False, gridfile:Optional[str] = None, 
-                 savevor:bool = False, saveneigh:bool = False, 
-                 neighfile:Optional[str] = None, gs:int = -1, 
+                 savegrid:bool = False, gridfile:Optional[str] = None,
+                 savevor:bool = False, saveneigh:bool = False,
+                 neighfile:Optional[str] = None, gs:int = -1,
                  weighted:bool = False, verbose:bool = False) -> None:
-        
+
         self.dimension = dimension
         self.alpha = alpha
         self.fpost = fpost # cluster file
@@ -153,10 +153,10 @@ class PAMM:
         self.qs = qs
         self.nmsopt = nmsopt
         self.ngrid = ngrid
-        #self.bootstrap = bootstrap
         self.fspread = fspread
         self.fpoints = fpoints
-        self.period = read_period(period_text)
+        self.period = read_period(period_text, self.dimension)
+        self.periodic = False if period_text is None else True
         self.zeta = zeta
         self.thrmerg = thrmerg
         self.thrpcl = thrpcl
@@ -177,10 +177,10 @@ class PAMM:
         if len(self.period) != self.dimension:
             raise ValueError('Check the number of periodic dimensions!')
 
-    def run(self, descriptorfile):
+    def run(self, descriptors: np.ndarray, weights: Optional[np.ndarray] = None):
 
         self.nsamples, self.descriptor, self.weight, self.totw = \
-            self._read_descriptor_and_weights(descriptorfile)
+            self._read_descriptor_and_weights(descriptors, weights)
         self.totw = 1
         if self.ngrid == -1:
         # If not specified, the number of voronoi polyhedra
@@ -201,7 +201,7 @@ class PAMM:
         idmindist = np.argmin(dist_matrix, axis=1)
         self.gabriel = self.get_gabriel_graph(dist_matrix)
         h_invs, normkernels, qscut2, self.sigma2, self.flocal, self.h_tr_normed = \
-            self.computes_localization(igrid, dist_matrix)
+            self.computes_localization(self.mindist)
         self.h_inv = h_invs
         self.normkernel = normkernels
         self.idmindist = idmindist
@@ -222,12 +222,12 @@ class PAMM:
 
         raise NotImplementedError
 
-    def _read_descriptor_and_weights(self, descriptorfile:str):
+    def _read_descriptor_and_weights(self, descriptors: np.ndarray, weights: Optional[np.ndarray]):
         '''Read the descriptor file provided.
 
         Args:
-            descriptorfile: a string, the name of your file containing
-            your descriptors and weights (if needed)
+            descriptor: a np.ndarray, the coordinates of your sample points
+            weights: a np.ndarray, the weights of your sample points
         
         Returns:
             nsamples: int, the number of samples
@@ -236,21 +236,20 @@ class PAMM:
             totw: float, the sum of weight array
         '''
 
-        content = np.loadtxt(descriptorfile)
-        assert self.dimension + self.weighted == content.shape[1], \
-               'Please check the number of columns of your descriptor' \
-               'file. It does not equal the number of descriptor ' \
-               'plusing weight (if needed in your input arguments).'
-        nsamples = content.shape[0]
-        descriptor = content[:, :self.dimension]
-        if not self.weighted:
-            weight = np.full(nsamples, 1, dtype=float)
-        else:
-            weight = content[:, -1]
-        totw = np.sum(weight)
-        weight /= totw
+        # Sanity check
+        assert self.dimension == descriptors.shape[1], \
+               'Please check the number of columns of your descriptor.' \
+               'It does not equal the number of descriptors. '
+        if self.weighted and weights is None:
+            raise ValueError('Please provide the weight array.')
 
-        return nsamples, descriptor, weight, totw
+        nsamples = descriptors.shape[0]
+        if weights is None:
+            weights = np.ones(nsamples)
+        totw = np.sum(weights)
+        weights /= totw
+
+        return nsamples, descriptors, weights, totw
 
     def from_gridfile(self):
 
@@ -271,16 +270,16 @@ class PAMM:
         return igrid
     def clustering(self):
 
+        labels = []
         grid_npoints = np.zeros(self.ngrid, dtype=int)
         grid_weight = np.zeros(self.ngrid)
         grid_neighbour = {i: [] for i in range(self.ngrid)}
 
         # assign samples to its cloeset grid
-        dist_grid2descriptor = []
-        for grid in self.grid_pos:
-            dist_grid2descriptor.append(pammr2(self.period, self.descriptor, grid))
-        dist_grid2descriptor = np.array(dist_grid2descriptor)
-        labels = np.argmin(dist_grid2descriptor, axis=0)
+        for descriptor in self.descriptor:
+            descriptor2grid = pammr2(self.period, descriptor, self.grid_pos)
+            labels.append(np.argmin(descriptor2grid))
+
         for ipoint, label in enumerate(labels):
             grid_npoints[label] += 1
             grid_weight[label] += self.weight[ipoint]
@@ -325,7 +324,7 @@ class PAMM:
                     print(' '.join(gabriel[i, :]), file=wfl)
         return gabriel
 
-    def computes_localization(self, igrid: np.ndarray, mindist: np.ndarray):
+    def computes_localization(self, mindist: np.ndarray):
         delta = 1 / self.nsamples
         # only one of the methods can be used at a time
         if self.fspread > 0:
@@ -333,11 +332,11 @@ class PAMM:
         cov = covariance(self.grid_pos, self.period, self.grid_weight, 1.0)
         print(f'Global eff. dim. {effdim(cov)}')
 
-        if self.period is not None:
+        if self.periodic:
             tune = sum(self.period ** 2)
         else:
             tune = np.trace(cov)
-        sigma2 = np.full(self.ngrid, tune)
+        sigma2 = np.full(self.ngrid, tune, dtype=float)
 
         # initialize the localization based on fraction of data spread
         if self.fspread > 0:
@@ -357,7 +356,9 @@ class PAMM:
             if self.fpoints > 0:
                 sigma2, flocal, wlocal = self._localization_based_on_fraction_of_points(sigma2, flocal, i, delta, tune)
             else:
-                sigma2, flocal, wlocal = self._localization_based_on_fraction_of_spread(sigma2, flocal, i, mindist)
+                if sigma2[i] < flocal[i]:
+                    sigma2, flocal, wlocal = \
+                        self._localization_based_on_fraction_of_spread(sigma2, flocal, i, mindist)
             h_invs[i], normkernels[i], qscut2[i], h_tr_normed[i] = \
                 self._bandwidth_estimation_from_localization(wlocal, flocal, i)
 
@@ -389,9 +390,8 @@ class PAMM:
     
     def _localization_based_on_fraction_of_spread(self, sigma2, flocal, idx, mindist):
 
-        if sigma2[idx] < mindist[idx]:
-            sigma2[idx] = mindist[idx]
-            wlocal, flocal[idx] = localization(self.period, self.descriptor, self.grid_pos, self.grid_weight, sigma2[idx])
+        sigma2[idx] = mindist[idx]
+        wlocal, flocal[idx] = localization(self.period, self.descriptor, self.grid_pos, self.grid_weight, sigma2[idx])
 
         return sigma2, flocal, wlocal
 
