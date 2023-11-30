@@ -25,7 +25,7 @@ EXPECTED_LEN = 272330
 def test_basic_hbpamm():
 
     runner = HBPAMM(ta='O', td='O', th='H', cutoff=4.5, 
-                    weighted=True, 
+                    weighted=True,
                     box='12.4244, 12.4244, 12.4244, 90, 90, 90')
     result = runner.run('examples/water/h2o-blyp-piglet.xyz')
     assert len(result[0]) == len(result[1])
