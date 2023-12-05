@@ -3,138 +3,10 @@ import warnings
 from typing import Optional
 import numpy as np
 from numba import jit
-from scipy.special import logsumexp as LSE
 from skmatter.feature_selection import FPS
-from pysrc.utils.dist import pammr2, pammrij, mahalanobis
-
-def read_period(period_text: str, dimension: int):
-
-    if period_text is None:
-        return np.full(dimension, -1)
-
-    period = []
-    for num in period_text.split(','):
-        period.append(eval(num))
-        if period[-1] == 6.28: 
-            period[-1] = 2 * np.pi
-        elif period[-1] == 3.14: 
-            period[-1] = np.pi
-
-    return np.array(period)
-
-@jit(nopython=True)
-def covariance(grid_pos: np.ndarray, period: np.ndarray,
-               grid_weight: np.ndarray, totw: float):
-    """
-    Calculate the covariance matrix for a given set of grid positions and weights.
-
-    Parameters:
-        grid_pos (np.ndarray): An array of shape (nsample, dimension)
-        representing the grid positions.
-        period (np.ndarray): An array of shape (dimension,)
-        representing the periodicity of each dimension.
-        grid_weight (np.ndarray): An array of shape (nsample,)
-        representing the weights of the grid positions.
-        totw (float): The total weight.
-
-    Returns:
-        cov (np.ndarray): The covariance matrix of shape (dimension, dimension).
-
-    Note:
-        The function assumes that the grid positions, weights, and total weight are provided correctly.
-        The function handles periodic and non-periodic dimensions differently to calculate the covariance matrix.
-    """
-
-    nsample = grid_pos.shape[0]
-    dimension = grid_pos.shape[1]
-    xm = np.zeros(dimension)
-    xxm = np.zeros((nsample, dimension))
-    xxmw = np.zeros((nsample, dimension))
-    for i in range(dimension):
-        if period[i] > 0:
-            sumsin = np.sum(grid_weight * np.sin(grid_pos[:, i]) *\
-                            (2 * np.pi) / period[i]) / totw
-            sumcos = np.sum(grid_weight * np.cos(grid_pos[:, i]) *\
-                            (2 * np.pi) / period[i]) / totw
-            xm[i] = np.arctan2(sumsin, sumcos)
-        else:
-            xm[i] = np.sum(grid_pos[:, i] * grid_weight) / totw
-        xxm[:, i] = grid_pos[:, i] - xm[i]
-        if period[i] > 0:
-            xxm[:, i] -= np.round(xxm[:, i] / period[i]) * period[i]
-    xxmw = xxm * grid_weight.reshape(-1, 1) / totw
-    cov = xxmw.T.dot(xxm)
-    cov /= 1 - sum((grid_weight / totw) ** 2)
-
-    return cov
-
-def effdim(cov):
-
-    eigval = np.linalg.eigvals(cov)
-    eigval /= sum(eigval)
-    eigval *= np.log(eigval)
-    eigval[np.isnan(eigval)] = 0.
-    
-    return np.exp(-sum(eigval))
-
-@jit(nopython=True)
-def localization(period: np.ndarray, grid_pos: np.ndarray, target_grid_pos: np.ndarray, grid_weight: np.ndarray, s2: float):
-    """
-    Calculates the localization of a set of vectors in a grid.
-
-    Args:
-        period (np.ndarray): An array of periods for each dimension of the grid.
-        x (np.ndarray): An array of vectors to be localized.
-        y (np.ndarray): An array of target vectors representing the grid.
-        grid_weight (np.ndarray): An array of weights for each target vector.
-        s2 (float): The scaling factor for the squared distance.
-
-    Returns:
-        tuple: A tuple containing two numpy arrays:
-            wl (np.ndarray): An array of localized weights for each vector.
-            num (np.ndarray): The sum of the localized weights.
-
-    """
-
-    dimension = len(period)
-    xy = grid_pos - target_grid_pos
-    for i in range(dimension):
-        if period[i] <= 0:
-            continue
-        # scaled length
-        xy[:, i] /= period[i]
-        # Finds the smallest separation between the images of the vector elements
-        xy[:, i] -= np.round(xy[:, i])
-        # Rescale back the length
-        xy[:, i] *= period[i]
-    wl = np.exp(-0.5 / s2 * np.sum(xy**2, axis=1)) * grid_weight
-    num = np.sum(wl)
-
-    return wl, num
-
-@jit(nopython=True)
-def oas(cov, n, D):
-
-    tr = np.trace(cov)
-    tr2 = tr ** 2
-    tr_cov2 = np.trace(cov ** 2)
-    phi = ((1 - 2 / D) * tr_cov2 + tr2) / ((n + 1 - 2 / D) * tr_cov2 - tr2 / D)
-
-    return (1 - phi) * cov + np.eye(D) * phi * tr /D # np.diag([phi * tr /D for i in range(D)])
-
-def logsumexp(v1: np.ndarray, probs: np.ndarray, clusterid: int):
-
-    mask = v1 == clusterid
-    probs = np.copy(probs)
-    probs[~mask] = -np.inf
-
-    return LSE(probs)
-
-def getidmax(v1: np.ndarray, probs: np.ndarray, clusterid: int):
-
-    tmpv = np.copy(probs)
-    tmpv[v1 != clusterid] = -np.inf
-    return np.argmax(tmpv)
+from pysrc.utils._pamm import effdim, localization, read_period, covariance, oas, logsumexp, getidmax
+from pysrc.utils.dist import pammr2, pammrij, mahalanobis, get_squared_dist_matrix
+from pysrc.utils.graph import get_gabriel_graph
 
 
 class PAMM:
@@ -173,6 +45,8 @@ class PAMM:
         self.weighted = weighted
         self.verbose = verbose
 
+        self.kdecut2 = 9 * (np.sqrt(self.dimension) + 1) ** 2
+
         if self.qs < 0:
             raise ValueError('The QS scaling should be positive')
         #if self.bootstrap < 0:
@@ -186,8 +60,8 @@ class PAMM:
             self._read_descriptor_and_weights(descriptors, weights)
         self.totw = 1
         if self.ngrid == -1:
-        # If not specified, the number of voronoi polyhedra
-        # are set to the square root of the total number of points
+            # If not specified, the number of voronoi polyhedra
+            # are set to the square root of the total number of points
             self.ngrid = int(np.sqrt(self.nsamples))
         self.pabserr = np.full(self.ngrid, 0.0)
         self.prelerr = np.full(self.ngrid, np.inf)
@@ -198,11 +72,12 @@ class PAMM:
             igrid = self.cal_grid()
         self.grid_pos = self.descriptor[igrid]
         self.grid_npoints, self.grid_weight, self.grid_neighbour, self.iminij = self.clustering()
-        dist_matrix = self.get_grid_dist_matrix()
-        self.dist_matrix = dist_matrix
-        self.mindist = np.min(dist_matrix, axis=1)
-        idmindist = np.argmin(dist_matrix, axis=1)
-        self.gabriel = self.get_gabriel_graph(dist_matrix)
+        if self.verbose:
+            print(" Precalculate distance matrix between grid points")
+        self.dist_matrix = get_squared_dist_matrix(self.grid_pos, self.period)
+        self.mindist = np.min(self.dist_matrix, axis=1)
+        idmindist = np.argmin(self.dist_matrix, axis=1)
+        self.gabriel = get_gabriel_graph(self.dist_matrix)
         h_invs, normkernels, qscut2, self.sigma2, self.flocal, self.h_tr_normed = \
             self.computes_localization(self.mindist)
         self.h_inv = h_invs
@@ -213,18 +88,14 @@ class PAMM:
             self.computes_kernel_density_estimation(h_invs, normkernels, 
                                                     igrid, self.grid_neighbour)
         cluster_centers, idxroot = \
-            self.quick_shift(self.probs, dist_matrix, idmindist, qscut2)
+            self.quick_shift(self.probs, self.dist_matrix, idmindist, qscut2)
         cluster_centers, idxroot = \
             self.post_process(cluster_centers, idxroot, self.probs)
         self.cluster_centers = cluster_centers
         self.idxroot = idxroot
-        self.generate_probability_model()
+        # self.generate_probability_model()
 
         return cluster_centers
-
-    def post_processing(self, clusterfile:str):
-
-        raise NotImplementedError
 
     def _read_descriptor_and_weights(self, descriptors: np.ndarray, weights: Optional[np.ndarray]):
         '''Read the descriptor file provided.
@@ -298,39 +169,7 @@ class PAMM:
 
         return grid_npoints, grid_weight, grid_neighbour, labels
 
-    def get_grid_dist_matrix(self):
-        if self.verbose:
-            print(" Precalculate distance matrix between grid points")
-
-        dist_matrix = np.zeros((self.ngrid, self.ngrid))
-        for i in range(self.ngrid):
-            dist_matrix[i, i:] = \
-                pammr2(self.period, self.grid_pos[i:], self.grid_pos[i])
-            dist_matrix[i:, i] = dist_matrix[i, i:]
-        #if self.gs > 0:
-        np.fill_diagonal(dist_matrix, np.inf)
-
-        return dist_matrix
-
-    def get_gabriel_graph(self, dist_matrix2: np.ndarray):
-
-        gabriel = np.full((self.ngrid, self.ngrid), True)
-        for i in range(self.ngrid):
-            gabriel[i, i] = False
-            for j in range(i, self.ngrid):
-                if np.sum(dist_matrix2[i] + dist_matrix2[j] < dist_matrix2[i, j]):
-                    gabriel[i, j] = False
-                    gabriel[j, i] = False
-
-        if self.saveneigh:
-            neigh_file = os.path.basename(self.outputfile) + '.neigh'
-            with open(neigh_file, 'w') as wfl:
-                for i in range(self.ngrid):
-                    print(' '.join(gabriel[i, :]), file=wfl)
-        return gabriel
-
     def computes_localization(self, mindist: np.ndarray):
-        delta = 1 / self.nsamples
         # only one of the methods can be used at a time
         if self.fspread > 0:
             self.fpoints = -1.
@@ -341,29 +180,31 @@ class PAMM:
             tune = sum(self.period ** 2)
         else:
             tune = np.trace(cov)
-        sigma2 = np.full(self.ngrid, tune, dtype=float)
 
+        sigma2 = np.full(self.ngrid, tune, dtype=float)
         # initialize the localization based on fraction of data spread
         if self.fspread > 0:
             sigma2 *= self.fspread ** 2
+
         if self.verbose:
             print('Estimating kernel density bandwidths')
-        ndescriptor = self.descriptor.shape[1]
         flocal = np.zeros(self.ngrid)
-        h_invs = np.zeros((self.ngrid, ndescriptor, ndescriptor))
+        h_invs = np.zeros((self.ngrid, self.dimension, self.dimension))
         normkernels = np.zeros(self.ngrid)
         qscut2 = np.zeros(self.ngrid)
         h_tr_normed = np.zeros(self.ngrid)
         for i in range(self.ngrid):
             if self.verbose and (i % 100 == 0):
                 print(f'  {i} / {self.ngrid}')
-            wlocal, flocal[i] = localization(self.period, self.grid_pos, self.grid_pos[i], self.grid_weight, sigma2[i])
+            wlocal, flocal[i] = localization(self.period, self.grid_pos, self.grid_pos[i],
+                                             self.grid_weight, sigma2[i])
             if self.fpoints > 0:
-                sigma2, flocal, wlocal = self._localization_based_on_fraction_of_points(sigma2, flocal, i, delta, tune)
-            else:
-                if sigma2[i] < flocal[i]:
-                    sigma2, flocal, wlocal = \
-                        self._localization_based_on_fraction_of_spread(sigma2, flocal, i, mindist)
+                sigma2, flocal, wlocal = \
+                    self._localization_based_on_fraction_of_points(sigma2, flocal, i,
+                                                                   1 / self.nsamples, tune)
+            elif sigma2[i] < flocal[i]:
+                sigma2, flocal, wlocal = \
+                    self._localization_based_on_fraction_of_spread(sigma2, flocal, i, mindist)
             h_invs[i], normkernels[i], qscut2[i], h_tr_normed[i] = \
                 self._bandwidth_estimation_from_localization(wlocal, flocal, i)
 
@@ -376,27 +217,31 @@ class PAMM:
         lim = self.fpoints
         if lim <= self.grid_weight[idx]:
             lim = self.grid_weight[idx] + delta
-            warnings.warn(" Warning: localization smaller than voronoi, increase grid size (meanwhile adjusted localization)!")
+            warnings.warn(" Warning: localization smaller than voronoi,"
+                          " increase grid size (meanwhile adjusted localization)!")
         while flocal[idx] < lim:
             sigma2[idx] += tune
-            wlocal, flocal[idx] = localization(self.period, self.grid_pos, self.grid_pos[idx], self.grid_weight, sigma2[idx])
+            wlocal, flocal[idx] = localization(self.period, self.grid_pos, self.grid_pos[idx],
+                                               self.grid_weight, sigma2[idx])
         j = 1
         while True:
             if flocal[idx] > lim:
                 sigma2[idx] -= tune / 2 ** j
             else:
                 sigma2[idx] += tune / 2 ** j
-            wlocal, flocal[idx] = localization(self.period, self.grid_pos, self.grid_pos[idx], self.grid_weight, sigma2[idx])
+            wlocal, flocal[idx] = localization(self.period, self.grid_pos, self.grid_pos[idx],
+                                               self.grid_weight, sigma2[idx])
             if abs(flocal[idx] - lim) < delta:
                 break
             j += 1
 
         return sigma2, flocal, wlocal
-    
+
     def _localization_based_on_fraction_of_spread(self, sigma2, flocal, idx, mindist):
 
         sigma2[idx] = mindist[idx]
-        wlocal, flocal[idx] = localization(self.period, self.descriptor, self.grid_pos, self.grid_weight, sigma2[idx])
+        wlocal, flocal[idx] = localization(self.period, self.descriptor, self.grid_pos,
+                                           self.grid_weight, sigma2[idx])
 
         return sigma2, flocal, wlocal
 
@@ -405,8 +250,7 @@ class PAMM:
         cov_i = covariance(self.grid_pos, self.period, wlocal, flocal[idx])
         nlocal = flocal[idx] * self.nsamples
         self.local_dimension[idx] = effdim(cov_i)
-        cov_i = oas(cov_i, nlocal, self.descriptor.shape[1])
-        # cov_i_inv = np.linalg.inv(cov_i)
+        cov_i = oas(cov_i, nlocal, self.dimension)
         h = (4. / (self.local_dimension[idx] + 2.)) ** (2. / (self.local_dimension[idx] + 4.))\
             * nlocal ** (-2. / (self.local_dimension[idx] + 4.)) * cov_i
         h_tr_normed = np.trace(h) / h.shape[0]
@@ -416,13 +260,12 @@ class PAMM:
         qscut2 = np.trace(cov_i)
 
         return  h_inv, normkernel, qscut2, h_tr_normed
-    
+
     def computes_kernel_density_estimation(self, h_inv: np.ndarray, normkernel: np.ndarray, igrid: np.ndarray, neighbour: dict):
 
         if self.verbose:
             print('Computing kernel density on reference points')
-        d = self.descriptor.shape[1]
-        self.kdecut2 = 9 * (np.sqrt(d) + 1) ** 2
+        
         prob = np.full(self.ngrid, -np.inf)
         for i in range(self.ngrid):
             if self.verbose and (i % 100 == 0):
@@ -430,7 +273,6 @@ class PAMM:
             dummd1s = mahalanobis(self.period, self.grid_pos, self.grid_pos[i], h_inv)
 
             for j, dummd1 in enumerate(dummd1s):
-                
                 if dummd1 > self.kdecut2:
                     lnk = -0.5 * (normkernel[j] + dummd1) + np.log(self.grid_weight[j])
                     prob[i] = _update_prob(prob[i], lnk)
@@ -460,7 +302,8 @@ class PAMM:
                 if self.gs > 0:
                     idxroot[qspath[-1]] = self.gs_next(qspath[-1], probs, self.gs, dist_matrix)
                 else:
-                    idxroot[qspath[-1]] = self.qs_next(qspath[-1], idmindist[qspath[-1]], probs, dist_matrix, qscut2[qspath[-1]])
+                    idxroot[qspath[-1]] = self.qs_next(qspath[-1], idmindist[qspath[-1]],
+                                                       probs, dist_matrix, qscut2[qspath[-1]])
                 if idxroot[idxroot[qspath[-1]]] != -1:
                     break
                 qspath.append(idxroot[qspath[-1]])
@@ -474,7 +317,7 @@ class PAMM:
     def gs_next(self, idx: int, probs: np.ndarray, n_shells: int, distmm: np.ndarray):
 
         neighs = np.copy(self.gabriel[idx])
-        for i in range(1, n_shells):
+        for _ in range(1, n_shells):
             nneighs = np.full(self.ngrid, False)
             for j in range(self.ngrid):
                 if neighs[j]:
@@ -594,10 +437,9 @@ class PAMM:
 
     def get_output(self, outputfile: str):
 
-        nfeature = self.descriptor.shape[1]
         with open(outputfile, 'w') as wfl:
             for i in range(self.ngrid):
-                for j in range(nfeature):
+                for j in range(self.dimension):
                     wfl.write(f'{self.grid_pos[i][j]:>15.4e}')
                 wfl.write(f'{np.argmin(abs(self.cluster_centers - self.idxroot[i])):>15d}')
                 wfl.write(f'{self.probs[i]:>15.4e}')
