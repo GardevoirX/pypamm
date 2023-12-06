@@ -3,8 +3,9 @@ import warnings
 from typing import Optional
 import numpy as np
 from numba import jit
+from rich.progress import track
 from skmatter.feature_selection import FPS
-from pysrc.utils._pamm import effdim, localization, read_period, covariance, oas, logsumexp, getidmax
+from pysrc.utils._pamm import effdim, localization, read_period, covariance, oas, logsumexp, getidmax, gs_next, qs_next
 from pysrc.utils.dist import pammr2, pammrij, mahalanobis, get_squared_dist_matrix
 from pysrc.utils.graph import get_gabriel_graph
 
@@ -45,6 +46,9 @@ class PAMM:
         self.weighted = weighted
         self.verbose = verbose
 
+        # only one of the methods can be used at a time
+        if self.fspread > 0:
+            self.fpoints = -1.
         self.kdecut2 = 9 * (np.sqrt(self.dimension) + 1) ** 2
 
         if self.qs < 0:
@@ -54,10 +58,11 @@ class PAMM:
         if len(self.period) != self.dimension:
             raise ValueError('Check the number of periodic dimensions!')
 
-    def run(self, descriptors: np.ndarray, weights: Optional[np.ndarray] = None):
+    def fit(self, x: np.ndarray, y: Optional[np.ndarray] = None, 
+            sample_weight: Optional[np.ndarray] = None):
 
-        self.nsamples, self.descriptor, self.weight, self.totw = \
-            self._read_descriptor_and_weights(descriptors, weights)
+        self.nsamples, self.descriptor, self.weight = \
+            self._read_descriptor_and_weights(x, sample_weight)
         self.totw = 1
         if self.ngrid == -1:
             # If not specified, the number of voronoi polyhedra
@@ -85,7 +90,7 @@ class PAMM:
         self.idmindist = idmindist
         self.qscut2 = qscut2
         self.probs = \
-            self.computes_kernel_density_estimation(h_invs, normkernels, 
+            self.computes_kernel_density_estimation(h_invs, normkernels, \
                                                     igrid, self.grid_neighbour)
         cluster_centers, idxroot = \
             self.quick_shift(self.probs, self.dist_matrix, idmindist, qscut2)
@@ -108,7 +113,6 @@ class PAMM:
             nsamples: int, the number of samples
             descriptor: np.ndarray, the descriptor
             weight: np.ndarray, the weight
-            totw: float, the sum of weight array
         '''
 
         # Sanity check
@@ -124,7 +128,7 @@ class PAMM:
         totw = np.sum(weights)
         weights /= totw
 
-        return nsamples, descriptors, weights, totw
+        return nsamples, descriptors, weights
 
     def from_gridfile(self):
 
@@ -170,9 +174,7 @@ class PAMM:
         return grid_npoints, grid_weight, grid_neighbour, labels
 
     def computes_localization(self, mindist: np.ndarray):
-        # only one of the methods can be used at a time
-        if self.fspread > 0:
-            self.fpoints = -1.
+
         cov = covariance(self.grid_pos, self.period, self.grid_weight, 1.0)
         print(f'Global eff. dim. {effdim(cov)}')
 
@@ -186,16 +188,12 @@ class PAMM:
         if self.fspread > 0:
             sigma2 *= self.fspread ** 2
 
-        if self.verbose:
-            print('Estimating kernel density bandwidths')
         flocal = np.zeros(self.ngrid)
         h_invs = np.zeros((self.ngrid, self.dimension, self.dimension))
         normkernels = np.zeros(self.ngrid)
         qscut2 = np.zeros(self.ngrid)
         h_tr_normed = np.zeros(self.ngrid)
-        for i in range(self.ngrid):
-            if self.verbose and (i % 100 == 0):
-                print(f'  {i} / {self.ngrid}')
+        for i in track(range(self.ngrid), description='Estimating kernel density bandwidths'):
             wlocal, flocal[i] = localization(self.period, self.grid_pos, self.grid_pos[i],
                                              self.grid_weight, sigma2[i])
             if self.fpoints > 0:
@@ -263,22 +261,17 @@ class PAMM:
 
     def computes_kernel_density_estimation(self, h_inv: np.ndarray, normkernel: np.ndarray, igrid: np.ndarray, neighbour: dict):
 
-        if self.verbose:
-            print('Computing kernel density on reference points')
-        
         prob = np.full(self.ngrid, -np.inf)
-        for i in range(self.ngrid):
-            if self.verbose and (i % 100 == 0):
-                print(f'  {i} / {self.ngrid}')
+        for i in track(range(self.ngrid), description='Computing kernel density on reference points'):
             dummd1s = mahalanobis(self.period, self.grid_pos, self.grid_pos[i], h_inv)
-
             for j, dummd1 in enumerate(dummd1s):
                 if dummd1 > self.kdecut2:
                     lnk = -0.5 * (normkernel[j] + dummd1) + np.log(self.grid_weight[j])
                     prob[i] = _update_prob(prob[i], lnk)
                 else:
                     neighbours = neighbour[j][neighbour[j] != igrid[i]]
-                    dummd1s = mahalanobis(self.period, self.descriptor[neighbours], self.grid_pos[i], h_inv[j])
+                    dummd1s = mahalanobis(self.period, self.descriptor[neighbours],
+                                          self.grid_pos[i], h_inv[j])
                     lnks = -0.5 * (normkernel[j] + dummd1s) + np.log(self.weight[neighbours])
                     prob[i] = _update_probs(prob[i], lnks)
 
@@ -300,54 +293,18 @@ class PAMM:
             qspath.append(i)
             while qspath[-1] != idxroot[qspath[-1]]:
                 if self.gs > 0:
-                    idxroot[qspath[-1]] = self.gs_next(qspath[-1], probs, self.gs, dist_matrix)
+                    idxroot[qspath[-1]] = gs_next(qspath[-1], probs, self.gs,
+                                                  dist_matrix, self.gabriel)
                 else:
-                    idxroot[qspath[-1]] = self.qs_next(qspath[-1], idmindist[qspath[-1]],
-                                                       probs, dist_matrix, qscut2[qspath[-1]])
+                    idxroot[qspath[-1]] = qs_next(qspath[-1], idmindist[qspath[-1]],
+                                                  probs, dist_matrix, qscut2[qspath[-1]])
                 if idxroot[idxroot[qspath[-1]]] != -1:
                     break
                 qspath.append(idxroot[qspath[-1]])
-            if i == 0:
-                print(qspath)
             idxroot[qspath] = idxroot[idxroot[qspath[-1]]]
         cluster_centers = np.concatenate(np.argwhere(idxroot == np.arange(self.ngrid)))
 
         return cluster_centers, idxroot
-
-    def gs_next(self, idx: int, probs: np.ndarray, n_shells: int, distmm: np.ndarray):
-
-        neighs = np.copy(self.gabriel[idx])
-        for _ in range(1, n_shells):
-            nneighs = np.full(self.ngrid, False)
-            for j in range(self.ngrid):
-                if neighs[j]:
-                    nneighs |= self.gabriel[j]
-            neighs |= nneighs
-        gs_next = idx
-        dmin = np.inf
-        for j in range(self.ngrid):
-            if probs[j] > probs[idx] and \
-               distmm[idx, j] < dmin and \
-               neighs[j]:
-                gs_next = j
-                dmin = distmm[idx, j]
-
-        return gs_next
-
-    def qs_next(self, idx:int, idxn: int, probs: np.ndarray, distmm: np.ndarray, lambda_: float):
-
-        dmin = np.inf
-        qs_next = idx
-        if probs[idxn] > probs[idx]:
-            qs_next = idxn
-        for j in range(self.ngrid):
-            if probs[j] > probs[idx] and \
-               distmm[idx, j] < dmin and \
-               distmm[idx, j] < lambda_:
-                qs_next = j
-                dmin = distmm[idx, j]
-
-        return qs_next
 
     def post_process(self, cluster_centers: np.ndarray, idxroot: np.ndarray, probs: np.ndarray):
 

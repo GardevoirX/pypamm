@@ -2,6 +2,48 @@ import numpy as np
 from numba import jit
 from scipy.special import logsumexp as LSE
 
+@jit(nopython=True)
+def gs_next(idx: int, probs: np.ndarray, n_shells: int, distmm: np.ndarray, gabriel: np.ndarray):
+    """Find next cluster in Gabriel graph."""
+
+    ngrid = len(probs)
+    neighs = np.copy(gabriel[idx])
+    for _ in range(1, n_shells):
+        nneighs = np.full(ngrid, False)
+        for j in range(ngrid):
+            if neighs[j]:
+                nneighs |= gabriel[j]
+        neighs |= nneighs
+
+    next_idx = idx
+    dmin = np.inf
+    for j in range(ngrid):
+        if probs[j] > probs[idx] and \
+            distmm[idx, j] < dmin and \
+            neighs[j]:
+            next_idx = j
+            dmin = distmm[idx, j]
+
+    return next_idx
+
+@jit(nopython=True)
+def qs_next(idx:int, idxn: int, probs: np.ndarray, distmm: np.ndarray, lambda_: float):
+    """Find next cluster with respect to qscut(lambda_)."""
+
+    ngrid = len(probs)
+    dmin = np.inf
+    next_idx = idx
+    if probs[idxn] > probs[idx]:
+        next_idx = idxn
+    for j in range(ngrid):
+        if probs[j] > probs[idx] and \
+            distmm[idx, j] < dmin and \
+            distmm[idx, j] < lambda_:
+            next_idx = j
+            dmin = distmm[idx, j]
+
+    return next_idx
+
 def logsumexp(v1: np.ndarray, probs: np.ndarray, clusterid: int):
 
     mask = v1 == clusterid

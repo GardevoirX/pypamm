@@ -18,10 +18,11 @@ def test_basic_pamm():
                   outputfile='fp0.1-qs1',
                   verbose=True)
     descriptors = loadtxt(DISCRIPTORFILE)
-    runner.run(descriptors)
+    runner.fit(descriptors)
     runner.get_output(OUTPUTFILE)
     out = loadtxt(OUTPUTFILE)
     fout = loadtxt(FOUTPUTFILE)
     out[:, -9] += 1
     assert allclose(out[:, -5:], fout[:, -5:], atol=1e-3)
-    assert allclose(out[:, :-7], fout[:, :-7], atol=1e-3)
+    assert allclose(out[:, -8:-7], fout[:, -8:-7], atol=1e-3)
+    assert allclose(out[:, :-9], fout[:, :-9], atol=1e-3)
