@@ -24,27 +24,22 @@ class PAMM:
         center_idx (np.ndarray): The indices of the cluster centers.
         labels_ (np.ndarray): The labels of each grid.
         """
-    
-    def __init__(self, descriptors:np.ndarray, 
-                 dimension, sample_weight: Optional[np.ndarray] = None, alpha:float = 1.,
-                 fpost:bool = False, seed:int = 12345, qs:float = 1.,
-                 nmsopt:int = 0, ngrid:int = -1,
+
+    def __init__(self, descriptors:np.ndarray, dimension:int, ngrid:int,
+                 sample_weight: Optional[np.ndarray] = None,
+                 period_text:Optional[str]= None,
+                 qs:float = 1., gs:int = -1, 
+                 nmsopt:int = 0, thrpcl:float = 0.,
                  fspread:float = -1., fpoints:float = 0.15,
-                 period_text:Optional[str]= None, zeta:float = 0.,
-                 thrmerg:float = 0.8, thrpcl:float = 0., outputfile:str = 'out',
-                 savegrid:bool = False,
-                 savevor:bool = False, saveneigh:bool = False,
-                 neighfile:Optional[str] = None, gs:int = -1,
-                 verbose:bool = False) -> None:
+                 outputfile:str = 'out', seed:int = 12345, verbose:bool = False):
+
+        np.random.seed(seed)
 
         self.descriptor = descriptors
         self.nsamples = descriptors.shape[0]
         self.weight, self._totw = \
             self._read_weights(sample_weight)
         self.dimension = dimension
-        self.alpha = alpha
-        self.fpost = fpost # cluster file
-        self.seed = seed
         self.qs = qs
         self.nmsopt = nmsopt
         self.ngrid = ngrid
@@ -52,14 +47,8 @@ class PAMM:
         self.fpoints = fpoints
         self.period = read_period(period_text, self.dimension)
         self.periodic = False if period_text is None else True
-        self.zeta = zeta
-        self.thrmerg = thrmerg
         self.thrpcl = thrpcl
         self.outputfile = outputfile
-        self.savegrid = savegrid
-        self.savevor = savevor
-        self.saveneigh = saveneigh
-        self.neighfile = neighfile
         self.gs = gs
         self.verbose = verbose
 
