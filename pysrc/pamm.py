@@ -176,6 +176,12 @@ class PAMM:
         """The coordinates of the cluster centers"""
         return self.grid_pos[self.center_idx]
 
+    @property
+    def _normpks(self):
+        if not hasattr(self, '__normpks'):
+            self.__normpks = logsumexp(np.ones(self.ngrid), self._probs, 1)
+        return self.__normpks
+
     def fit(self,
             X: np.ndarray,
             y: Optional[np.ndarray] = None):
@@ -183,8 +189,6 @@ class PAMM:
 
         self.grid_idx = X
         self._grid_npoints, self._grid_neighbour, self.iminij = self._clustering()
-        if self.verbose:
-            print(" Precalculate distance matrix between grid points")
         self._h_invs, self._normkernels, self._qscut2 = self._computes_localization(self._mindist)
         self._computes_kernel_density_estimation(self._h_invs, self._normkernels, \
                                                  self.grid_idx, self._grid_neighbour)
@@ -228,6 +232,7 @@ class PAMM:
         igrid = fps.selected_idx_
 
         return igrid
+
     def _clustering(self):
 
         labels = []
@@ -291,6 +296,7 @@ class PAMM:
 
         qscut2 *= self.qs ** 2
 
+        self.cluster_attributes['local_dimension'] = self.local_dimension
         self.cluster_attributes['sigma2'] = sigma2
         self.cluster_attributes['flocal'] = flocal
         self.cluster_attributes['h_trace_normed'] = h_tr_normed
@@ -400,9 +406,8 @@ class PAMM:
 
         nk = len(cluster_centers)
         to_merge = np.full(nk, False)
-        self.normpks = logsumexp(np.ones(len(idxroot)), probs, 1)
         for k in range(nk):
-            dummd1 = np.exp(logsumexp(idxroot, probs, cluster_centers[k]) - self.normpks)
+            dummd1 = np.exp(logsumexp(idxroot, probs, cluster_centers[k]) - self._normpks)
             to_merge[k] = dummd1 > self.thrpcl
         # merge the outliers
         for i in range(nk):
@@ -434,6 +439,18 @@ class PAMM:
         return cluster_centers, idxroot
 
     def bootstrap(self, nbootstrap: int):
+        """
+        Generates a bootstrap estimate of the standard errors 
+        for the given number of bootstrap iterations.
+
+        Args:
+            nbootstrap (int): The number of bootstrap iterations to perform.
+
+        Returns:
+            tuple: A tuple containing the bootstrap estimate of the absolute errors (pabserr), 
+                   the bootstrap estimate of the relative errors (prelerr), 
+                   and the bootstrap samples (bs).
+        """
 
         if nbootstrap == 0:
             for i in range(self.ngrid):
@@ -458,15 +475,15 @@ class PAMM:
                     np.log(self.grid_weight[j])
                 n_bootsample += nsample
                 for i in range(self.ngrid):
-                    dummd1 = mahalanobis(self.period, self.grid_pos[i], self.grid_pos[j], self.h_inv[j])
+                    dummd1 = mahalanobis(self.period, self.grid_pos[i], self.grid_pos[j], self._h_invs[j])
                     if dummd1 > self.kdecut2:
-                        lnk = -0.5 * (self.normkernel[j] + dummd1) + dummd2
+                        lnk = -0.5 * (self._normkernels[j] + dummd1) + dummd2
                         prob_boot[n, i] = _update_prob(prob_boot[n, i], lnk)
                     else:
                         select = np.random.choice(self._grid_npoints[j], nsample)
                         idx = self._grid_neighbour[j][select]
-                        dummd1s = mahalanobis(self.period, self.descriptor[idx], self.grid_pos[i], self.h_inv[j])
-                        lnks = -0.5 * (self.normkernel[j] + dummd1s) + np.log(self.weight[idx])
+                        dummd1s = mahalanobis(self.period, self.descriptor[idx], self.grid_pos[i], self._h_invs[j])
+                        lnks = -0.5 * (self._normkernels[j] + dummd1s) + np.log(self.weight[idx])
                         prob_boot[n, i] = _update_probs(prob_boot[n, i], lnks)
             prob_boot[n] -= np.log(self._totw) + np.log(n_bootsample / self.nsamples)
             cluster_centers, idxroot = self._quick_shift(prob_boot[n], self._dist_matrix, self._idmindist, self._qscut2)
@@ -483,6 +500,16 @@ class PAMM:
 
 
     def get_output(self, outputfile: str):
+        """
+        Writes the output of the grid values, labels, probabilities,
+        errors, and other attributes to a file.
+
+        Parameters:
+            outputfile (str): The name of the output file.
+
+        Returns:
+            None
+        """
 
         with open(outputfile, 'w') as wfl:
             for i in range(self.ngrid):
@@ -500,52 +527,66 @@ class PAMM:
                 wfl.write('\n')
 
     def generate_probability_model(self):
+        """
+        Generates a probability model based on the given inputs.
 
-        n_cluster = len(self.center_idx)
-        cluster_mean = np.zeros((n_cluster, self.dimension), dtype=float)
-        cluster_cov = np.zeros((n_cluster, self.dimension, self.dimension), dtype=float)
-        cluster_weight = np.zeros(n_cluster, dtype=float)
+        Parameters:
+            None
 
-        for k in range(n_cluster):
+        Returns:
+            None
+        """
+
+        cluster_mean = np.zeros((self.n_clusters, self.dimension), dtype=float)
+        cluster_cov = np.zeros((self.n_clusters, self.dimension, self.dimension), dtype=float)
+        cluster_weight = np.zeros(self.n_clusters, dtype=float)
+
+        for k in range(self.n_clusters):
             cluster_mean[k] = self.grid_pos[self.center_idx[k]]
             cluster_weight[k] = np.exp(logsumexp(self.labels_, self._probs, self.center_idx[k])
-                                       - self.normpks)
+                                       - self._normpks)
             for _ in range(self.nmsopt):
                 msmu = np.zeros(self.dimension, dtype=float)
                 tmppks = -np.inf
                 for i in range(self.ngrid):
                     dummd1 = mahalanobis(self.period, self.grid_pos[i],
                                          self.grid_pos[self.center_idx[k]],
-                                         self.h_inv[self.center_idx[k]])
-                    msw = -0.5 * (self.normkernel[self.center_idx[k]] + dummd1) + self._probs[i]
+                                         self._h_invs[self.center_idx[k]])
+                    msw = -0.5 * (self._normkernels[self.center_idx[k]] + dummd1) + self._probs[i]
                     tmpmsmu = 0.
                     tmpmsmu = pammrij(self.period, tmpmsmu, self.grid_pos[i],
                                       self.grid_pos[self.center_idx[k]])
                     msmu += np.exp(msw) * tmpmsmu
                 tmppks = _update_prob(tmppks, msw)
                 cluster_mean[k] += msmu / np.exp(tmppks)
-            if self.periodic:
-                cluster_cov[k] = self._get_lcov_clusterp(self.ngrid, self.nsamples, self.grid_pos,
-                                                         self.labels_, self.center_idx[k], self._probs)
-                if np.sum(self.labels_ == self.center_idx[k]) == 1:
-                    cluster_cov[k] = self._get_lcov_clusterp(self.nsamples, self.nsamples,
-                                                             self.descriptor,
-                                                             self.iminij, self.center_idx[k], self.weight)
-                    print('Warning: single point cluster!')
-            else:
-                cluster_cov[k] = self._get_lcov_cluster(self.ngrid, self.grid_pos,
-                                                        self.labels_, self.center_idx[k], self._probs)
-                if np.sum(self.labels_ == self.center_idx[k]) == 1:
-                    cluster_cov[k] = self._get_lcov_cluster(self.nsamples, self.descriptor,
-                                                            self.iminij, self.center_idx[k], self.weight)
-                    print('Warning: single point cluster!')
-                cluster_cov[k] = oas(cluster_cov[k], logsumexp(self.labels_, self._probs, self.center_idx[k]) * self.nsamples, self.dimension)
+            cluster_cov[k] = self._update_cluster_cov(k)
 
         with open(self.outputfile + '.pamm', 'w', encoding='utf-8') as wfl:
             wfl.write(f'# PAMMv2 clusters analysis. NSamples: {self.nsamples}'
                         f'Ngrid: {self.ngrid} QSLambda: {self.qs}\n')
             wfl.write('# Dimensionality/NClusters//Pk/Mean/Covariance/Period\n')
-            self._write_clusters(wfl, n_cluster, cluster_weight, cluster_mean, cluster_cov)
+            self._write_clusters(wfl, self.n_clusters, cluster_weight, cluster_mean, cluster_cov)
+
+    def _update_cluster_cov(self, k: int):
+
+        if self.periodic:
+            cov = self._get_lcov_clusterp(self.ngrid, self.nsamples, self.grid_pos,
+                                          self.labels_, self.center_idx[k], self._probs)
+            if np.sum(self.labels_ == self.center_idx[k]) == 1:
+                cov = self._get_lcov_clusterp(self.nsamples, self.nsamples,
+                                              self.descriptor, self.iminij,
+                                              self.center_idx[k], self.weight)
+                print('Warning: single point cluster!')
+        else:
+            cov = self._get_lcov_cluster(self.ngrid, self.grid_pos,
+                                         self.labels_, self.center_idx[k], self._probs)
+            if np.sum(self.labels_ == self.center_idx[k]) == 1:
+                cov = self._get_lcov_cluster(self.nsamples, self.descriptor,
+                                             self.iminij, self.center_idx[k], self.weight)
+                print('Warning: single point cluster!')
+            cov = oas(cov, logsumexp(self.labels_, self._probs, self.center_idx[k]) * self.nsamples, self.dimension)
+
+        return cov
 
     def _get_lcov_cluster(self, N: int, x: np.ndarray, clroots: np.ndarray, idcl: int, probs: np.ndarray):
 
