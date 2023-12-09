@@ -13,6 +13,7 @@ class MinMaxClustering:
         self.selected_idx_ = np.full(n_cluster, -1, dtype=int)
         self.selected_idx_[:len(init_grid_idx)] = init_grid_idx
         self._min_dist = None
+        self.labels_ = None
         self.period = period
         if self.period is not None:
             self._distance = _euclidean_distance_period
@@ -43,13 +44,20 @@ class MinMaxClustering:
 
         return self
 
-    def transform(self, X: np.ndarray) -> np.ndarray:
+    def predict(self, X: np.ndarray) -> np.ndarray:
         """Transform the data."""
         if X.shape != self.support_.shape:
             raise ValueError("X has a different shape than during the fitting.")
-        return X[self.support_]
+
+        self.labels_ = []
+        for point in X:
+            descriptor2grid = self._distance(point, self.cluster_centers_, self.period)
+            self.labels_.append(np.argmin(descriptor2grid))
+
+        return self.labels_
 
     def _post_init(self, X: np.ndarray, y: Optional[np.ndarray] = None):
         self.support_ = np.full(X.shape, False)
         self.support_[self.selected_idx_] = True
+        self.cluster_centers_ = X[self.selected_idx_]
     

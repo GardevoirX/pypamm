@@ -1,5 +1,5 @@
 from numpy.linalg import norm
-from .dist import pammr2
+from pysrc.utils.dist import pammr2
 
 def _euclidean_distance(x, y, period = None):
     return norm(x - y, axis=1)

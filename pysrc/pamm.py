@@ -188,7 +188,7 @@ class PAMM:
         """Computing the PAMM algorithm."""
 
         self.grid_idx = X
-        self._grid_npoints, self._grid_neighbour, self.iminij = self._clustering()
+        self._grid_npoints, self._grid_neighbour, self._sample_labels_ = self._clustering()
         self._h_invs, self._normkernels, self._qscut2 = self._computes_localization(self._mindist)
         self._computes_kernel_density_estimation(self._h_invs, self._normkernels, \
                                                  self.grid_idx, self._grid_neighbour)
@@ -221,17 +221,6 @@ class PAMM:
         totw = 1.
 
         return weights, totw
-
-    def cal_grid(self):
-
-        if self.verbose:
-            print(f'NSamples: {self.nsamples}')
-            print(f'Selecting: {self.ngrid} points using MINMAX')
-        fps = FPS(n_to_select=self.ngrid)
-        fps.fit(self.descriptor.T)
-        igrid = fps.selected_idx_
-
-        return igrid
 
     def _clustering(self):
 
@@ -574,7 +563,7 @@ class PAMM:
                                           self.labels_, self.center_idx[k], self._probs)
             if np.sum(self.labels_ == self.center_idx[k]) == 1:
                 cov = self._get_lcov_clusterp(self.nsamples, self.nsamples,
-                                              self.descriptor, self.iminij,
+                                              self.descriptor, self._sample_labels_,
                                               self.center_idx[k], self.weight)
                 print('Warning: single point cluster!')
         else:
@@ -582,7 +571,7 @@ class PAMM:
                                          self.labels_, self.center_idx[k], self._probs)
             if np.sum(self.labels_ == self.center_idx[k]) == 1:
                 cov = self._get_lcov_cluster(self.nsamples, self.descriptor,
-                                             self.iminij, self.center_idx[k], self.weight)
+                                             self._sample_labels_, self.center_idx[k], self.weight)
                 print('Warning: single point cluster!')
             cov = oas(cov, logsumexp(self.labels_, self._probs, self.center_idx[k]) * self.nsamples, self.dimension)
 

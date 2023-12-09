@@ -1,5 +1,5 @@
 import numpy as np
-from pysrc.cluster import MinMaxClustering
+from pysrc.clustering import MinMaxClustering
 
 def test_basic():
 
