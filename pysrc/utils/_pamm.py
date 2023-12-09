@@ -1,6 +1,30 @@
 import numpy as np
+import pandas as pd
 from numba import jit
 from scipy.special import logsumexp as LSE
+
+def create_sample_attributes(n_samples):
+
+    sample_attributes = pd.DataFrame()
+    sample_attributes['labels'] = np.full(n_samples, -1, dtype=int)
+    sample_attributes['weights'] = np.full(n_samples, np.nan)
+
+    return sample_attributes
+
+def create_grid_attributes(n_clusters):
+
+    cluster_attributes = pd.DataFrame()
+    cluster_attributes['labels'] = np.full(n_clusters, -1, dtype=int)
+    cluster_attributes['probs'] = np.full(n_clusters, np.nan)
+    cluster_attributes['pabserr'] = np.full(n_clusters, np.nan)
+    cluster_attributes['prelerr'] = np.full(n_clusters, np.nan)
+    cluster_attributes['sigma2'] = np.full(n_clusters, np.nan)
+    cluster_attributes['flocal'] = np.full(n_clusters, np.nan)
+    cluster_attributes['weights'] = np.full(n_clusters, np.nan)
+    cluster_attributes['local_dimension'] = np.full(n_clusters, np.nan)
+    cluster_attributes['h_trace_normed'] = np.full(n_clusters, np.nan)
+
+    return cluster_attributes
 
 @jit(nopython=True)
 def gs_next(idx: int, probs: np.ndarray, n_shells: int, distmm: np.ndarray, gabriel: np.ndarray):

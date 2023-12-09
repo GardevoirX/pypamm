@@ -1,27 +1,46 @@
-import os
 import warnings
-from typing import Optional
+from typing import Optional, Tuple
 import numpy as np
+import pandas as pd
 from numba import jit
 from rich.progress import track
 from skmatter.feature_selection import FPS
-from pysrc.utils._pamm import effdim, localization, read_period, covariance, oas, logsumexp, getidmax, gs_next, qs_next
+from pysrc.utils._pamm import *
 from pysrc.utils.dist import pammr2, pammrij, mahalanobis, get_squared_dist_matrix
 from pysrc.utils.graph import get_gabriel_graph
 
 
 class PAMM:
-    def __init__(self, dimension, alpha:float = 1.,
+    """Probabilistic Analysis of Molecular Motifs method.
+    
+    Args:
+        descriptors (np.ndarray): An array of molecular descriptors.
+        dimension (int): The number of dimensions.
+        sample_weight (Optional[np.ndarray]): An array of weights for each sample.
+        
+    Attributes:
+        n_clusters (int): The number of clusters.
+        cluster_centers (np.ndarray): The coordinates of the cluster centers.
+        center_idx (np.ndarray): The indices of the cluster centers.
+        labels_ (np.ndarray): The labels of each grid.
+        """
+    
+    def __init__(self, descriptors:np.ndarray, 
+                 dimension, sample_weight: Optional[np.ndarray] = None, alpha:float = 1.,
                  fpost:bool = False, seed:int = 12345, qs:float = 1.,
                  nmsopt:int = 0, ngrid:int = -1,
                  fspread:float = -1., fpoints:float = 0.15,
                  period_text:Optional[str]= None, zeta:float = 0.,
                  thrmerg:float = 0.8, thrpcl:float = 0., outputfile:str = 'out',
-                 savegrid:bool = False, gridfile:Optional[str] = None,
+                 savegrid:bool = False,
                  savevor:bool = False, saveneigh:bool = False,
                  neighfile:Optional[str] = None, gs:int = -1,
-                 weighted:bool = False, verbose:bool = False) -> None:
+                 verbose:bool = False) -> None:
 
+        self.descriptor = descriptors
+        self.nsamples = descriptors.shape[0]
+        self.weight, self._totw = \
+            self._read_weights(sample_weight)
         self.dimension = dimension
         self.alpha = alpha
         self.fpost = fpost # cluster file
@@ -38,18 +57,21 @@ class PAMM:
         self.thrpcl = thrpcl
         self.outputfile = outputfile
         self.savegrid = savegrid
-        self.gridfile = gridfile
         self.savevor = savevor
         self.saveneigh = saveneigh
         self.neighfile = neighfile
         self.gs = gs
-        self.weighted = weighted
         self.verbose = verbose
 
         # only one of the methods can be used at a time
         if self.fspread > 0:
             self.fpoints = -1.
         self.kdecut2 = 9 * (np.sqrt(self.dimension) + 1) ** 2
+        self.pabserr = np.full(self.ngrid, 0.0)
+        self.prelerr = np.full(self.ngrid, np.inf)
+        self.local_dimension = np.zeros(self.ngrid)
+
+        self.cluster_attributes = create_grid_attributes(self.ngrid)
 
         if self.qs < 0:
             raise ValueError('The QS scaling should be positive')
@@ -58,84 +80,143 @@ class PAMM:
         if len(self.period) != self.dimension:
             raise ValueError('Check the number of periodic dimensions!')
 
-    def fit(self, x: np.ndarray, y: Optional[np.ndarray] = None, 
-            sample_weight: Optional[np.ndarray] = None):
+    @property
+    def grid_pos(self):
+        """The coordinates of the grids"""
+        return self.descriptor[self.grid_idx]
 
-        self.nsamples, self.descriptor, self.weight = \
-            self._read_descriptor_and_weights(x, sample_weight)
-        self.totw = 1
-        if self.ngrid == -1:
-            # If not specified, the number of voronoi polyhedra
-            # are set to the square root of the total number of points
-            self.ngrid = int(np.sqrt(self.nsamples))
-        self.pabserr = np.full(self.ngrid, 0.0)
-        self.prelerr = np.full(self.ngrid, np.inf)
-        self.local_dimension = np.zeros(self.ngrid)
-        if self.gridfile:
-            igrid = self.from_gridfile()
+    @property
+    def grid_weight(self):
+        """The weights of the grids"""
+        if np.any(np.isnan(self.cluster_attributes['weights'])):
+            print('The clustering has not been performed yet')
         else:
-            igrid = self.cal_grid()
-        self.grid_pos = self.descriptor[igrid]
-        self.grid_npoints, self.grid_weight, self.grid_neighbour, self.iminij = self.clustering()
+            return self.cluster_attributes['weights'].to_numpy()
+
+    @property
+    def _dist_matrix(self):
+        """The distance matrix between grid points"""
+        if not hasattr(self, '__dist_matrix'):
+            self.__dist_matrix = get_squared_dist_matrix(self.grid_pos, self.period)
+        return self.__dist_matrix
+
+    @property
+    def _mindist(self):
+        """The minimum distance between grid points"""
+        if not hasattr(self, '__mindist'):
+            self.__mindist = np.min(self._dist_matrix, axis=1)
+        return self.__mindist
+
+    @property
+    def _idmindist(self):
+        """The index of the minimum distance between grid points"""
+        if not hasattr(self, '__idmindist'):
+            self.__idmindist = np.argmin(self._dist_matrix, axis=1)
+        return self.__idmindist
+
+    @property
+    def _gabriel(self):
+        """The Gabriel graph"""
+        if not hasattr(self, '__gabriel'):
+            self.__gabriel = get_gabriel_graph(self._dist_matrix, self.ngrid)
+        return self.__gabriel
+
+    @property
+    def labels_(self):
+        """The labels of each grid"""
+        if np.any(self.cluster_attributes['labels'] == -1):
+            print('The clustering has not been performed yet')
+        else:
+            return self.cluster_attributes['labels'].to_numpy()
+
+    @property
+    def _probs(self):
+        """The probabilities of each grid"""
+        if np.any(np.isnan(self.cluster_attributes['probs'])):
+            print('The clustering has not been performed yet')
+        else:
+            return self.cluster_attributes['probs'].to_numpy()
+
+    @property
+    def _sigma2(self):
+        if np.any(np.isnan(self.cluster_attributes['sigma2'])):
+            print('The clustering has not been performed yet')
+        else:
+            return self.cluster_attributes['sigma2'].to_numpy()
+
+    @property
+    def _flocal(self):
+        if np.any(np.isnan(self.cluster_attributes['flocal'])):
+            print('The clustering has not been performed yet')
+        else:
+            return self.cluster_attributes['flocal'].to_numpy()
+
+    @property
+    def _h_tr_normed(self):
+        if np.any(np.isnan(self.cluster_attributes['h_trace_normed'])):
+            print('The clustering has not been performed yet')
+        else:
+            return self.cluster_attributes['h_trace_normed'].to_numpy()
+
+
+    @property
+    def center_idx(self):
+        """The indices of the cluster centers"""
+        if not hasattr(self, '__center_idx'):
+            self.__center_idx = np.unique(self.labels_)
+        return self.__center_idx
+
+    @property
+    def n_clusters(self):
+        """The number of clusters"""
+        return len(self.center_idx)
+
+    @property
+    def cluster_centers(self):
+        """The coordinates of the cluster centers"""
+        return self.grid_pos[self.center_idx]
+
+    def fit(self,
+            X: np.ndarray,
+            y: Optional[np.ndarray] = None):
+        """Computing the PAMM algorithm."""
+
+        self.grid_idx = X
+        self._grid_npoints, self._grid_neighbour, self.iminij = self._clustering()
         if self.verbose:
             print(" Precalculate distance matrix between grid points")
-        self.dist_matrix = get_squared_dist_matrix(self.grid_pos, self.period)
-        self.mindist = np.min(self.dist_matrix, axis=1)
-        idmindist = np.argmin(self.dist_matrix, axis=1)
-        self.gabriel = get_gabriel_graph(self.dist_matrix)
-        h_invs, normkernels, qscut2, self.sigma2, self.flocal, self.h_tr_normed = \
-            self.computes_localization(self.mindist)
-        self.h_inv = h_invs
-        self.normkernel = normkernels
-        self.idmindist = idmindist
-        self.qscut2 = qscut2
-        self.probs = \
-            self.computes_kernel_density_estimation(h_invs, normkernels, \
-                                                    igrid, self.grid_neighbour)
-        cluster_centers, idxroot = \
-            self.quick_shift(self.probs, self.dist_matrix, idmindist, qscut2)
-        cluster_centers, idxroot = \
-            self.post_process(cluster_centers, idxroot, self.probs)
-        self.cluster_centers = cluster_centers
-        self.idxroot = idxroot
-        # self.generate_probability_model()
+        self._h_invs, self._normkernels, self._qscut2 = self._computes_localization(self._mindist)
+        self._computes_kernel_density_estimation(self._h_invs, self._normkernels, \
+                                                 self.grid_idx, self._grid_neighbour)
+        center_idx, labels = \
+            self._quick_shift(self._probs, self._dist_matrix, self._idmindist, self._qscut2)
+        center_idx, labels = \
+            self._post_process(center_idx, labels, self._probs)
 
-        return cluster_centers
+        self.cluster_attributes['labels'] = labels
 
-    def _read_descriptor_and_weights(self, descriptors: np.ndarray, weights: Optional[np.ndarray]):
+        #self.generate_probability_model()
+
+        return self
+
+    def _read_weights(self, weights:Optional[np.ndarray] = None) -> Tuple[int, np.ndarray]:
         '''Read the descriptor file provided.
 
         Args:
-            descriptor: a np.ndarray, the coordinates of your sample points
-            weights: a np.ndarray, the weights of your sample points
+            weights: a np.ndarray, the weights of your sample points. Optional
         
         Returns:
-            nsamples: int, the number of samples
-            descriptor: np.ndarray, the descriptor
             weight: np.ndarray, the weight
+            totw: float, the total weight
         '''
 
-        # Sanity check
-        assert self.dimension == descriptors.shape[1], \
-               'Please check the number of columns of your descriptor.' \
-               'It does not equal the number of descriptors. '
-        if self.weighted and weights is None:
-            raise ValueError('Please provide the weight array.')
-
-        nsamples = descriptors.shape[0]
         if weights is None:
-            weights = np.ones(nsamples)
+            weights = np.ones(self.nsamples)
         totw = np.sum(weights)
         weights /= totw
+        totw = 1.
 
-        return nsamples, descriptors, weights
-
-    def from_gridfile(self):
-
-        igrid = np.loadtxt(self.gridfile, dtype=int)[:self.ngrid]
-        igrid -= 1 #  fortran's array index starts from 1
-
-        return igrid
+        return weights, totw
 
     def cal_grid(self):
 
@@ -147,11 +228,11 @@ class PAMM:
         igrid = fps.selected_idx_
 
         return igrid
-    def clustering(self):
+    def _clustering(self):
 
         labels = []
         grid_npoints = np.zeros(self.ngrid, dtype=int)
-        grid_weight = np.zeros(self.ngrid)
+        grid_weight = np.zeros(self.ngrid, dtype=float)
         grid_neighbour = {i: [] for i in range(self.ngrid)}
 
         # assign samples to its cloeset grid
@@ -171,9 +252,11 @@ class PAMM:
         for key in grid_neighbour:
             grid_neighbour[key] = np.array(grid_neighbour[key])
 
-        return grid_npoints, grid_weight, grid_neighbour, labels
+        self.cluster_attributes['weights'] = grid_weight
 
-    def computes_localization(self, mindist: np.ndarray):
+        return grid_npoints, grid_neighbour, labels
+
+    def _computes_localization(self, mindist: np.ndarray):
 
         cov = covariance(self.grid_pos, self.period, self.grid_weight, 1.0)
         print(f'Global eff. dim. {effdim(cov)}')
@@ -208,7 +291,11 @@ class PAMM:
 
         qscut2 *= self.qs ** 2
 
-        return h_invs, normkernels, qscut2, sigma2, flocal, h_tr_normed
+        self.cluster_attributes['sigma2'] = sigma2
+        self.cluster_attributes['flocal'] = flocal
+        self.cluster_attributes['h_trace_normed'] = h_tr_normed
+
+        return h_invs, normkernels, qscut2
 
     def _localization_based_on_fraction_of_points(self, sigma2, flocal, idx, delta, tune):
 
@@ -259,7 +346,11 @@ class PAMM:
 
         return  h_inv, normkernel, qscut2, h_tr_normed
 
-    def computes_kernel_density_estimation(self, h_inv: np.ndarray, normkernel: np.ndarray, igrid: np.ndarray, neighbour: dict):
+    def _computes_kernel_density_estimation(self,
+                                            h_inv: np.ndarray,
+                                            normkernel: np.ndarray,
+                                            igrid: np.ndarray,
+                                            neighbour: dict):
 
         prob = np.full(self.ngrid, -np.inf)
         for i in track(range(self.ngrid), description='Computing kernel density on reference points'):
@@ -275,26 +366,25 @@ class PAMM:
                     lnks = -0.5 * (normkernel[j] + dummd1s) + np.log(self.weight[neighbours])
                     prob[i] = _update_probs(prob[i], lnks)
 
-        prob -= np.log(self.totw)
+        prob -= np.log(self._totw)
+        self.cluster_attributes['probs'] = prob
 
-        return prob
+    def _quick_shift(self,
+                     probs: np.ndarray,
+                     dist_matrix: np.ndarray,
+                     idmindist: np.ndarray,
+                     qscut2: np.ndarray):
 
-    def quick_shift(self, probs: np.ndarray, dist_matrix: np.ndarray, idmindist: np.ndarray, qscut2: np.ndarray):
-
-        if self.verbose:
-            print("Starting Quick-Shift")
         idxroot = np.full(self.ngrid, -1, dtype=int)
-        for i in range(self.ngrid):
+        for i in track(range(self.ngrid), description='Quick-Shift'):
             if idxroot[i] != -1:
                 continue
-            if self.verbose and (i % 1000 == 0):
-                print(f'  {i} / {self.ngrid}')
             qspath = []
             qspath.append(i)
             while qspath[-1] != idxroot[qspath[-1]]:
                 if self.gs > 0:
                     idxroot[qspath[-1]] = gs_next(qspath[-1], probs, self.gs,
-                                                  dist_matrix, self.gabriel)
+                                                  dist_matrix, self._gabriel)
                 else:
                     idxroot[qspath[-1]] = qs_next(qspath[-1], idmindist[qspath[-1]],
                                                   probs, dist_matrix, qscut2[qspath[-1]])
@@ -306,7 +396,7 @@ class PAMM:
 
         return cluster_centers, idxroot
 
-    def post_process(self, cluster_centers: np.ndarray, idxroot: np.ndarray, probs: np.ndarray):
+    def _post_process(self, cluster_centers: np.ndarray, idxroot: np.ndarray, probs: np.ndarray):
 
         nk = len(cluster_centers)
         to_merge = np.full(nk, False)
@@ -348,10 +438,10 @@ class PAMM:
         if nbootstrap == 0:
             for i in range(self.ngrid):
                 self.prelerr[i] = np.log(
-                    np.sqrt(((self.mindist[i] * 2 * np.pi) ** (-self.local_dimension[i]) / 
-                             np.exp(self.probs[i]) - 1) / 
+                    np.sqrt(((self._mindist[i] * 2 * np.pi) ** (-self.local_dimension[i]) / 
+                             np.exp(self._probs[i]) - 1) / 
                              self.nsamples))
-            self.pabserr = self.prelerr + self.probs
+            self.pabserr = self.prelerr + self._probs
             return self.pabserr, self.prelerr
 
         prob_boot = np.full((nbootstrap, self.ngrid), -np.inf)
@@ -361,10 +451,10 @@ class PAMM:
                 print(f'Bootstrap {n + 1} / {nbootstrap}')
             n_bootsample = 0
             for j in range(self.ngrid):
-                nsample = np.random.binomial(self.nsamples, self.grid_npoints[j] / self.nsamples)
+                nsample = np.random.binomial(self.nsamples, self._grid_npoints[j] / self.nsamples)
                 if nsample == 0:
                     continue
-                dummd2 = np.log(nsample / self.grid_npoints[j]) * \
+                dummd2 = np.log(nsample / self._grid_npoints[j]) * \
                     np.log(self.grid_weight[j])
                 n_bootsample += nsample
                 for i in range(self.ngrid):
@@ -373,21 +463,21 @@ class PAMM:
                         lnk = -0.5 * (self.normkernel[j] + dummd1) + dummd2
                         prob_boot[n, i] = _update_prob(prob_boot[n, i], lnk)
                     else:
-                        select = np.random.choice(self.grid_npoints[j], nsample)
-                        idx = self.grid_neighbour[j][select]
+                        select = np.random.choice(self._grid_npoints[j], nsample)
+                        idx = self._grid_neighbour[j][select]
                         dummd1s = mahalanobis(self.period, self.descriptor[idx], self.grid_pos[i], self.h_inv[j])
                         lnks = -0.5 * (self.normkernel[j] + dummd1s) + np.log(self.weight[idx])
                         prob_boot[n, i] = _update_probs(prob_boot[n, i], lnks)
-            prob_boot[n] -= np.log(self.totw) + np.log(n_bootsample / self.nsamples)
-            cluster_centers, idxroot = self.quick_shift(prob_boot[n], self.dist_matrix, self.idmindist, self.qscut2)
+            prob_boot[n] -= np.log(self._totw) + np.log(n_bootsample / self.nsamples)
+            cluster_centers, idxroot = self._quick_shift(prob_boot[n], self._dist_matrix, self._idmindist, self._qscut2)
             print(len(cluster_centers), 'cluster centers')
             for i in range(self.ngrid):
                 bs[n, i] = np.argmin(np.abs(cluster_centers - idxroot[i]))
         for i in range(self.ngrid):
             for j in range(nbootstrap):
-                self.pabserr[i] += np.exp(2 * _update_prob(prob_boot[j, i], self.probs[i]))
+                self.pabserr[i] += np.exp(2 * _update_prob(prob_boot[j, i], self._probs[i]))
             self.pabserr[i] = np.log(np.sqrt(self.pabserr[i] / (nbootstrap - 1)))
-            self.prelerr[i] = self.pabserr[i] - self.probs[i]
+            self.prelerr[i] = self.pabserr[i] - self._probs[i]
 
         return self.pabserr, self.prelerr, bs
 
@@ -398,59 +488,58 @@ class PAMM:
             for i in range(self.ngrid):
                 for j in range(self.dimension):
                     wfl.write(f'{self.grid_pos[i][j]:>15.4e}')
-                wfl.write(f'{np.argmin(abs(self.cluster_centers - self.idxroot[i])):>15d}')
-                wfl.write(f'{self.probs[i]:>15.4e}')
+                wfl.write(f'{np.argmin(abs(self.center_idx - self.labels_[i])):>15d}')
+                wfl.write(f'{self._probs[i]:>15.4e}')
                 wfl.write(f'{self.pabserr[i]:>15.4e}')
                 wfl.write(f'{self.prelerr[i]:>15.4e}')
-                wfl.write(f'{self.sigma2[i]:>15.4e}')
-                wfl.write(f'{self.flocal[i]:>15.4e}')
+                wfl.write(f'{self._sigma2[i]:>15.4e}')
+                wfl.write(f'{self._flocal[i]:>15.4e}')
                 wfl.write(f'{self.grid_weight[i]:>15.4e}')
                 wfl.write(f'{self.local_dimension[i]:>15.4e}')
-                wfl.write(f'{self.h_tr_normed[i]:>15.4e}')
+                wfl.write(f'{self._h_tr_normed[i]:>15.4e}')
                 wfl.write('\n')
 
     def generate_probability_model(self):
 
-        n_cluster = len(self.cluster_centers)
+        n_cluster = len(self.center_idx)
         cluster_mean = np.zeros((n_cluster, self.dimension), dtype=float)
         cluster_cov = np.zeros((n_cluster, self.dimension, self.dimension), dtype=float)
         cluster_weight = np.zeros(n_cluster, dtype=float)
 
         for k in range(n_cluster):
-            print(f'{self.cluster_centers[k]} {logsumexp(self.idxroot, self.probs, self.cluster_centers[k])}')
-            cluster_mean[k] = self.grid_pos[self.cluster_centers[k]]
-            cluster_weight[k] = np.exp(logsumexp(self.idxroot, self.probs, self.cluster_centers[k])
+            cluster_mean[k] = self.grid_pos[self.center_idx[k]]
+            cluster_weight[k] = np.exp(logsumexp(self.labels_, self._probs, self.center_idx[k])
                                        - self.normpks)
             for _ in range(self.nmsopt):
                 msmu = np.zeros(self.dimension, dtype=float)
                 tmppks = -np.inf
                 for i in range(self.ngrid):
                     dummd1 = mahalanobis(self.period, self.grid_pos[i],
-                                         self.grid_pos[self.cluster_centers[k]],
-                                         self.h_inv[self.cluster_centers[k]])
-                    msw = -0.5 * (self.normkernel[self.cluster_centers[k]] + dummd1) + self.probs[i]
+                                         self.grid_pos[self.center_idx[k]],
+                                         self.h_inv[self.center_idx[k]])
+                    msw = -0.5 * (self.normkernel[self.center_idx[k]] + dummd1) + self._probs[i]
                     tmpmsmu = 0.
                     tmpmsmu = pammrij(self.period, tmpmsmu, self.grid_pos[i],
-                                      self.grid_pos[self.cluster_centers[k]])
+                                      self.grid_pos[self.center_idx[k]])
                     msmu += np.exp(msw) * tmpmsmu
                 tmppks = _update_prob(tmppks, msw)
                 cluster_mean[k] += msmu / np.exp(tmppks)
             if self.periodic:
                 cluster_cov[k] = self._get_lcov_clusterp(self.ngrid, self.nsamples, self.grid_pos,
-                                                         self.idxroot, self.grid_pos[k])
-                if np.sum(self.idxroot == self.cluster_centers[k]) == 1:
+                                                         self.labels_, self.center_idx[k], self._probs)
+                if np.sum(self.labels_ == self.center_idx[k]) == 1:
                     cluster_cov[k] = self._get_lcov_clusterp(self.nsamples, self.nsamples,
                                                              self.descriptor,
-                                                             self.iminij, self.grid_pos[k])
+                                                             self.iminij, self.center_idx[k], self.weight)
                     print('Warning: single point cluster!')
             else:
                 cluster_cov[k] = self._get_lcov_cluster(self.ngrid, self.grid_pos,
-                                                        self.idxroot, self.cluster_centers[k])
-                if np.sum(self.idxroot == self.cluster_centers[k]) == 1:
+                                                        self.labels_, self.center_idx[k], self._probs)
+                if np.sum(self.labels_ == self.center_idx[k]) == 1:
                     cluster_cov[k] = self._get_lcov_cluster(self.nsamples, self.descriptor,
-                                                            self.iminij, self.cluster_centers[k])
+                                                            self.iminij, self.center_idx[k], self.weight)
                     print('Warning: single point cluster!')
-                cluster_cov[k] = oas(cluster_cov[k], logsumexp(self.idxroot, self.probs, self.cluster_centers[k]) * self.nsamples, self.dimension)
+                cluster_cov[k] = oas(cluster_cov[k], logsumexp(self.labels_, self._probs, self.center_idx[k]) * self.nsamples, self.dimension)
 
         with open(self.outputfile + '.pamm', 'w', encoding='utf-8') as wfl:
             wfl.write(f'# PAMMv2 clusters analysis. NSamples: {self.nsamples}'
@@ -458,26 +547,26 @@ class PAMM:
             wfl.write('# Dimensionality/NClusters//Pk/Mean/Covariance/Period\n')
             self._write_clusters(wfl, n_cluster, cluster_weight, cluster_mean, cluster_cov)
 
-    def _get_lcov_cluster(self, N: int, x: np.ndarray, clroots: np.ndarray, idcl: int):
+    def _get_lcov_cluster(self, N: int, x: np.ndarray, clroots: np.ndarray, idcl: int, probs: np.ndarray):
 
         ww = np.zeros(N)
-        normww = logsumexp(clroots, self.probs, idcl)
-        ww[clroots == idcl] = np.exp(self.probs[clroots == idcl] - normww)
+        normww = logsumexp(clroots, probs, idcl)
+        ww[clroots == idcl] = np.exp(probs[clroots == idcl] - normww)
         cov = covariance(x, self.period, ww, np.sum(ww))
 
         return cov
 
-    def _get_lcov_clusterp(self, N: int, Ntot: int, x: np.ndarray, clroots: np.ndarray, idcl: int):
+    def _get_lcov_clusterp(self, N: int, Ntot: int, x: np.ndarray, clroots: np.ndarray, idcl: int, probs: np.ndarray):
 
         ww = np.zeros(N)
-        totnormp = logsumexp(np.zeros(N), self.probs, 0)
+        totnormp = logsumexp(np.zeros(N), probs, 0)
         cov = np.zeros((self.dimension, self.dimension), dtype=float)
         xx = np.zeros(x.shape, dtype=float)
-        ww[clroots == idcl] = np.exp(self.probs[clroots == idcl] - totnormp)
+        ww[clroots == idcl] = np.exp(probs[clroots == idcl] - totnormp)
         ww *= Ntot
         nlk = np.sum(ww)
         for i in range(self.dimension):
-            xx[:, i] = x[:, i] - round(x[:, i] / self.period[i]) * self.period[i]
+            xx[:, i] = x[:, i] - np.round(x[:, i] / self.period[i]) * self.period[i]
             r2 = (np.sum(ww * np.cos(xx[:, i])) / nlk) ** 2 \
                 + (np.sum(ww * np.sin(xx[:, i])) / nlk) ** 2
             re2 = (nlk / (nlk - 1)) * (r2 - (1 / nlk))
@@ -490,7 +579,7 @@ class PAMM:
 
         wfl.write(f'{self.dimension} {n_cluster}\n')
         for k in range(n_cluster):
-            wfl.write(f'{self.cluster_centers[k]:>15d}')
+            wfl.write(f'{self.center_idx[k]:>15d}')
             wfl.write(f'{cluster_weight[k]:>15.8e}')
             for i in range(self.dimension):
                 wfl.write(f' {cluster_mean[k, i]:>15.8e}')

@@ -8,17 +8,18 @@ FOUTPUTFILE = 'test/betahairpin/fp0.1-qs1.grid'
 
 def test_basic_pamm():
 
-    runner = PAMM(dimension=30,
+    descriptors = loadtxt(DISCRIPTORFILE)
+    runner = PAMM(descriptors,
+                  dimension=30,
                   period_text='6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28,6.28',
                   ngrid=1000,
-                  gridfile='examples/betahairpin/GLOBAL/ref.idxs',
                   savevor=True,
                   fpoints=0.1,
                   qs=1,
                   outputfile='fp0.1-qs1',
                   verbose=True)
-    descriptors = loadtxt(DISCRIPTORFILE)
-    runner.fit(descriptors)
+    grid = loadtxt('examples/betahairpin/GLOBAL/ref.idxs', dtype=int)[:1000] - 1
+    runner.fit(grid)
     runner.get_output(OUTPUTFILE)
     out = loadtxt(OUTPUTFILE)
     fout = loadtxt(FOUTPUTFILE)
