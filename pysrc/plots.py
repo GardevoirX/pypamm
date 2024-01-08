@@ -5,8 +5,9 @@ import numpy as np
 def plot_contour_2D(model,
                     x_range: tuple,
                     y_range: tuple,
+                    periods: Optional[np.ndarray]=None,
                     gaussians: Optional[list[int]]=None,
-                    bin: float=0.01):
+                    bin: int=100):
     """
     Generate a 2D contour plot for a given model.
     
@@ -24,21 +25,21 @@ def plot_contour_2D(model,
 
     if gaussians is None:
         gaussians = [None]
-    x, y = np.meshgrid(np.arange(x_range[0], x_range[1], bin),
-                       np.arange(y_range[0], y_range[1], bin))
+
+    x, y = np.meshgrid(np.linspace(x_range[0], x_range[1], bin),
+                       np.linspace(y_range[0], y_range[1], bin))
     shape = x.shape
-    x, y = np.concatenate(x), np.concatenate(y)
-    X = np.array(list(zip(x, y)))
-    result = [np.sum([model(i, idx) for idx in gaussians]) for i in X]
-    result = np.array(result).reshape(shape)
-    x, y = np.meshgrid(np.arange(x_range[0], x_range[1], bin),
-                       np.arange(y_range[0], y_range[1], bin))
+    X = np.array(list(zip(np.concatenate(x), np.concatenate(y))))
+    result = np.array([np.sum([model(i, idx) for idx in gaussians]) for i in X]).reshape(shape)
+
     fig, ax = plt.subplots()
+    ax.set_xlim(x_range)
+    ax.set_ylim(y_range)
     ax.contour(x, y, result)
     cs = ax.contourf(x, y, result)
     cbar = fig.colorbar(cs, ax=ax)
     cbar.set_label('Probability density')
-    
+
     return fig, ax
 
 def cluster_distribution_2D(pamm,

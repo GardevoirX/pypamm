@@ -2,12 +2,14 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 import numpy as np
+from pysrc.utils.dist import pammrij
 
 @dataclass
 class GaussianMixtureModel:
     weights: np.ndarray
     means: np.ndarray
     covariances: np.ndarray
+    period: Optional[np.ndarray] = None
 
     def __post_init__(self):
         self.dimension = self.means.shape[1]
@@ -40,10 +42,14 @@ class GaussianMixtureModel:
 
         if len(x.shape) == 1:
             x = x[np.newaxis, :]
-
+        if self.period is not None:
+            xij = np.zeros(self.means.shape)
+            xij = pammrij(self.period, xij, x, self.means)
+        else:
+            xij = x - self.means
         p = self.weights * self.norm * \
-            np.exp(-0.5 * ((x - self.means)[:, np.newaxis, :] @ 
-                            self.cov_inv @ (x - self.means)[:, :, np.newaxis])).reshape(-1)
+            np.exp(-0.5 * (xij[:, np.newaxis, :] @
+                           self.cov_inv @ xij[:, :, np.newaxis])).reshape(-1)
         sum_p = np.sum(p)
         if i is None:
             return sum_p
