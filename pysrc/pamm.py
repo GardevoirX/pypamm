@@ -5,6 +5,7 @@ import pandas as pd
 from numba import jit
 from rich.progress import track
 from skmatter.feature_selection import FPS
+from pysrc.clustering import NearestNeighborClustering
 from pysrc.utils._pamm import *
 from pysrc.utils.dist import pammr2, pammrij, mahalanobis, get_squared_dist_matrix
 from pysrc.utils.graph import get_gabriel_graph
@@ -28,7 +29,7 @@ class PAMM:
     def __init__(self, descriptors:np.ndarray, dimension:int, ngrid:int,
                  sample_weight: Optional[np.ndarray] = None,
                  period_text:Optional[str]= None,
-                 qs:float = 1., gs:int = -1, 
+                 qs:float = 1., gs:int = -1,
                  nmsopt:int = 0, thrpcl:float = 0.,
                  fspread:float = -1., fpoints:float = 0.15,
                  outputfile:str = 'out', seed:int = 12345, verbose:bool = False):
@@ -113,7 +114,8 @@ class PAMM:
     @property
     def labels_(self):
         """The labels of each grid"""
-        if np.any(self.cluster_attributes['labels'] == -1):
+        if self.cluster_attributes['labels'][0] == -1:
+            # A very simple check
             print('The clustering has not been performed yet')
         else:
             return self.cluster_attributes['labels'].to_numpy()
@@ -121,32 +123,32 @@ class PAMM:
     @property
     def _probs(self):
         """The probabilities of each grid"""
-        if np.any(np.isnan(self.cluster_attributes['probs'])):
+        if np.isnan(self.cluster_attributes['probs'][0]):
+            # A very simple check
             print('The clustering has not been performed yet')
         else:
             return self.cluster_attributes['probs'].to_numpy()
 
     @property
     def _sigma2(self):
-        if np.any(np.isnan(self.cluster_attributes['sigma2'])):
+        if np.isnan(self.cluster_attributes['sigma2'][0]):
             print('The clustering has not been performed yet')
         else:
             return self.cluster_attributes['sigma2'].to_numpy()
 
     @property
     def _flocal(self):
-        if np.any(np.isnan(self.cluster_attributes['flocal'])):
+        if np.isnan(self.cluster_attributes['flocal'][0]):
             print('The clustering has not been performed yet')
         else:
             return self.cluster_attributes['flocal'].to_numpy()
 
     @property
     def _h_tr_normed(self):
-        if np.any(np.isnan(self.cluster_attributes['h_trace_normed'])):
+        if np.isnan(self.cluster_attributes['h_trace_normed'][0]):
             print('The clustering has not been performed yet')
         else:
             return self.cluster_attributes['h_trace_normed'].to_numpy()
-
 
     @property
     def center_idx(self):
@@ -177,7 +179,7 @@ class PAMM:
         """Computing the PAMM algorithm."""
 
         self.grid_idx = X
-        self._grid_npoints, self._grid_neighbour, self._sample_labels_ = self._clustering()
+        self._grid_npoints, self._grid_neighbour, self._sample_labels_ = self._assign_descriptors_to_grids()
         self._h_invs, self._normkernels, self._qscut2 = self._computes_localization(self._mindist)
         self._computes_kernel_density_estimation(self._h_invs, self._normkernels, \
                                                  self.grid_idx, self._grid_neighbour)
@@ -211,31 +213,14 @@ class PAMM:
 
         return weights, totw
 
-    def _clustering(self):
+    def _assign_descriptors_to_grids(self):
 
-        labels = []
-        grid_npoints = np.zeros(self.ngrid, dtype=int)
-        grid_weight = np.zeros(self.ngrid, dtype=float)
-        grid_neighbour = {i: [] for i in range(self.ngrid)}
-
-        # assign samples to its cloeset grid
-        for descriptor in self.descriptor:
-            descriptor2grid = pammr2(self.period, descriptor, self.grid_pos)
-            labels.append(np.argmin(descriptor2grid))
-
-        for ipoint, label in enumerate(labels):
-            grid_npoints[label] += 1
-            grid_weight[label] += self.weight[ipoint]
-            grid_neighbour[label].append(ipoint)
-
-        assert np.sum(grid_weight == 0) == 0, \
-            "Error: voronoi has no points associated with" \
-            "- probably two points are perfectly overlapping"
-
-        for key in grid_neighbour:
-            grid_neighbour[key] = np.array(grid_neighbour[key])
-
-        self.cluster_attributes['weights'] = grid_weight
+        assigner = NearestNeighborClustering(self.period)
+        assigner.fit(self.grid_pos)
+        labels = assigner.predict(self.descriptor, sample_weight=self.weight)
+        grid_npoints = assigner.grid_npoints
+        grid_neighbour = assigner.grid_neighbour
+        self.cluster_attributes['weights'] = assigner.grid_weight
 
         return grid_npoints, grid_neighbour, labels
 
@@ -539,11 +524,13 @@ class PAMM:
                 cluster_mean[k] += msmu / np.exp(tmppks)
             cluster_cov[k] = self._update_cluster_cov(k)
 
-        with open(self.outputfile + '.pamm', 'w', encoding='utf-8') as wfl:
+        '''with open(self.outputfile + '.pamm', 'w', encoding='utf-8') as wfl:
             wfl.write(f'# PAMMv2 clusters analysis. NSamples: {self.nsamples}'
                         f'Ngrid: {self.ngrid} QSLambda: {self.qs}\n')
             wfl.write('# Dimensionality/NClusters//Pk/Mean/Covariance/Period\n')
-            self._write_clusters(wfl, self.n_clusters, cluster_weight, cluster_mean, cluster_cov)
+            self._write_clusters(wfl, self.n_clusters, cluster_weight, cluster_mean, cluster_cov)'''
+
+        return cluster_weight, cluster_mean, cluster_cov
 
     def _update_cluster_cov(self, k: int):
 

@@ -55,6 +55,7 @@ class HBPAMM:
     def run(self, trajectory: str):
         feature_collection = []
         weight_collection = []
+        had_pairs_collection = []
         u = mda.Universe(trajectory)
         self.masktypes = self._assign_atomtypes(u)
         if self.dopamm:
@@ -94,6 +95,7 @@ class HBPAMM:
                 weight = None
             feature_collection.append(feature)
             weight_collection.append(weight)
+            had_pairs_collection.append(had_pairs)
             if self.dopamm:
                 # 418-430
                 raise NotImplementedError
@@ -111,7 +113,8 @@ class HBPAMM:
                 raise NotImplementedError
 
         return np.concatenate(feature_collection), \
-               np.concatenate(weight_collection)
+               np.concatenate(weight_collection), \
+               had_pairs_collection
 
     def _too_many_types_warning(self, types: list, descriptor: str):
         if len(types) > MAXPARS:

@@ -1,3 +1,4 @@
+from numba import jit
 from numpy.linalg import norm
 from pysrc.utils.dist import pammr2
 
