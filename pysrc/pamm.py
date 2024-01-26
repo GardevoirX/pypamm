@@ -136,12 +136,14 @@ class PAMM:
         else:
             return self.cluster_attributes['probs'].to_numpy()
 
+    @property
     def _pabserr(self):
         if np.isnan(self.cluster_attributes['pabserr'][0]):
             print('The clustering has not been performed yet')
         else:
             return self.cluster_attributes['pabserr'].to_numpy()
 
+    @property
     def _prelerr(self):
         if np.isnan(self.cluster_attributes['prelerr'][0]):
             print('The clustering has not been performed yet')
@@ -505,8 +507,8 @@ class PAMM:
                     wfl.write(f'{self.grid_pos[i][j]:>15.4e}')
                 wfl.write(f'{np.argmin(abs(self.center_idx - self.labels_[i])):>15d}')
                 wfl.write(f'{self._probs[i]:>15.4e}')
-                wfl.write(f'{self.pabserr[i]:>15.4e}')
-                wfl.write(f'{self.prelerr[i]:>15.4e}')
+                wfl.write(f'{self._pabserr[i]:>15.4e}')
+                wfl.write(f'{self._prelerr[i]:>15.4e}')
                 wfl.write(f'{self._sigma2[i]:>15.4e}')
                 wfl.write(f'{self._flocal[i]:>15.4e}')
                 wfl.write(f'{self.grid_weight[i]:>15.4e}')
