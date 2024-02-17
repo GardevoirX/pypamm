@@ -38,7 +38,10 @@ def plot_contour_2D(model,
     ax.contour(x, y, result)
     cs = ax.contourf(x, y, result)
     cbar = fig.colorbar(cs, ax=ax)
-    cbar.set_label('Probability density')
+    if gaussians is None:
+        cbar.set_label('Probability density')
+    else:
+        cbar.set_label('Probability of belonging to selected gaussians')
 
     return fig, ax
 

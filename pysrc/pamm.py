@@ -17,7 +17,18 @@ class PAMM:
     Args:
         descriptors (np.ndarray): An array of molecular descriptors.
         dimension (int): The number of dimensions.
+        ngrid (int): The number of grid points in the descriptors.
         sample_weight (Optional[np.ndarray]): An array of weights for each sample.
+        period_text (Optional[str]): A string of periods for each dimension.
+        qs (float): Scaling factor used during the QS clustering.
+        gs (int): The neighbor shell for gabriel shift.
+        nmsopt (int): The number of mean-shift refinement steps.
+        thrpcl (float): Clusters with a pk loewr than this value are merged with the NN.
+        fspread (float): The fractional variance for bandwidth estimation.
+        fpoints (float): The fractional number of grid points.
+        outputfile (str): The name of the output file.
+        seed (int): The seed for the random number generator.
+        verbose (bool): Whether to print verbose output.
         
     Attributes:
         n_clusters (int): The number of clusters.
@@ -57,16 +68,12 @@ class PAMM:
         if self.fspread > 0:
             self.fpoints = -1.
         self.kdecut2 = 9 * (np.sqrt(self.dimension) + 1) ** 2
-        self.pabserr = np.full(self.ngrid, 0.0)
-        self.prelerr = np.full(self.ngrid, np.inf)
         self.local_dimension = np.zeros(self.ngrid)
 
         self.cluster_attributes = create_grid_attributes(self.ngrid)
 
         if self.qs < 0:
             raise ValueError('The QS scaling should be positive')
-        #if self.bootstrap < 0:
-        #    raise ValueError('The number of iterations should be positive')
         if len(self.period) != self.dimension:
             raise ValueError('Check the number of periodic dimensions!')
 
@@ -128,6 +135,20 @@ class PAMM:
             print('The clustering has not been performed yet')
         else:
             return self.cluster_attributes['probs'].to_numpy()
+
+    @property
+    def _pabserr(self):
+        if np.isnan(self.cluster_attributes['pabserr'][0]):
+            print('The clustering has not been performed yet')
+        else:
+            return self.cluster_attributes['pabserr'].to_numpy()
+
+    @property
+    def _prelerr(self):
+        if np.isnan(self.cluster_attributes['prelerr'][0]):
+            print('The clustering has not been performed yet')
+        else:
+            return self.cluster_attributes['prelerr'].to_numpy()
 
     @property
     def _sigma2(self):
@@ -415,14 +436,18 @@ class PAMM:
                    and the bootstrap samples (bs).
         """
 
+
+        if nbootstrap < 0:
+            raise ValueError('The number of iterations should be non-negative')
+        _prelerr = np.full(self.ngrid, np.inf)
+        _pabserr = np.full(self.ngrid, 0.0)
         if nbootstrap == 0:
             for i in range(self.ngrid):
-                self.prelerr[i] = np.log(
-                    np.sqrt(((self._mindist[i] * 2 * np.pi) ** (-self.local_dimension[i]) / 
-                             np.exp(self._probs[i]) - 1) / 
+                _prelerr[i] = np.log(
+                    np.sqrt(((self._mindist[i] * 2 * np.pi) ** (-self.local_dimension[i]) /
+                             np.exp(self._probs[i]) - 1) /
                              self.nsamples))
-            self.pabserr = self.prelerr + self._probs
-            return self.pabserr, self.prelerr
+            _pabserr = _prelerr + self._probs
 
         prob_boot = np.full((nbootstrap, self.ngrid), -np.inf)
         bs = np.zeros((nbootstrap, self.ngrid))
@@ -455,12 +480,14 @@ class PAMM:
                 bs[n, i] = np.argmin(np.abs(cluster_centers - idxroot[i]))
         for i in range(self.ngrid):
             for j in range(nbootstrap):
-                self.pabserr[i] += np.exp(2 * _update_prob(prob_boot[j, i], self._probs[i]))
-            self.pabserr[i] = np.log(np.sqrt(self.pabserr[i] / (nbootstrap - 1)))
-            self.prelerr[i] = self.pabserr[i] - self._probs[i]
+                _pabserr[i] += np.exp(2 * _update_prob(prob_boot[j, i], self._probs[i]))
+            _pabserr[i] = np.log(np.sqrt(_pabserr[i] / (nbootstrap - 1)))
+            _prelerr[i] = _pabserr[i] - self._probs[i]
 
-        return self.pabserr, self.prelerr, bs
+        self.cluster_attributes['pabserr'] = _pabserr
+        self.cluster_attributes['prelerr'] = _prelerr
 
+        return bs
 
     def get_output(self, outputfile: str):
         """
@@ -480,8 +507,8 @@ class PAMM:
                     wfl.write(f'{self.grid_pos[i][j]:>15.4e}')
                 wfl.write(f'{np.argmin(abs(self.center_idx - self.labels_[i])):>15d}')
                 wfl.write(f'{self._probs[i]:>15.4e}')
-                wfl.write(f'{self.pabserr[i]:>15.4e}')
-                wfl.write(f'{self.prelerr[i]:>15.4e}')
+                wfl.write(f'{self._pabserr[i]:>15.4e}')
+                wfl.write(f'{self._prelerr[i]:>15.4e}')
                 wfl.write(f'{self._sigma2[i]:>15.4e}')
                 wfl.write(f'{self._flocal[i]:>15.4e}')
                 wfl.write(f'{self.grid_weight[i]:>15.4e}')

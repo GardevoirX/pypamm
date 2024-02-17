@@ -17,8 +17,19 @@ def parse_xyz_cell_comment():
 
 
 class HBPAMM:
-    def __init__(self, ta, td, th, clusterfile=None, box=None, alpha=1,
-                 cutoff=5., vghb='1', delta=1, zeta=0, dosad=False,
+    """Preprocessig moduel for HBond PAMM analysis
+
+    Args:
+        ta (str): Name of the acceptor atom
+        td (str): Name of the donor atom
+        th (str): Name of the hydrogen atom
+        clusterfile (str): Name of the cluster file
+        box: PBC box
+        cutoff (float): Cutoff for the mu distance of the H-Bond descriptor
+        delta (int): Number of skipping frames
+    """
+    def __init__(self, ta, td, th, clusterfile=None, box=None,
+                 cutoff=5., delta=1, dosad=False,
                  npt_mode=False, weighted=False) -> None:
 
         # some default value of parameters
@@ -39,11 +50,8 @@ class HBPAMM:
         if not clusterfile is None:
             self.dopamm = True
         self.cell = parse_cell(box)
-        self.alpha = alpha
         self.mucutoff = cutoff
-        self.vghb = [eval(num) for num in vghb.split(',')]
         self.delta = delta
-        self.zeta = zeta
         self.dosad = dosad
         self.npt_mode = npt_mode
         self.weighted = weighted
@@ -51,7 +59,7 @@ class HBPAMM:
         if self.dosad and (not self.dopamm):
             raise NotImplementedError("Error: cannot compute lifetime statistics without cluster data!")
         #self.icell = inv(self.cell)
-        
+
     def run(self, trajectory: str):
         feature_collection = []
         weight_collection = []
@@ -77,7 +85,7 @@ class HBPAMM:
                                      self.cell[iframe]) # r
             mu = h2d_dist.reshape(h2d_dist.shape[0], 1, h2d_dist.shape[1]) + \
                  h2a_dist.reshape(h2a_dist.shape[0], h2a_dist.shape[1], 1)
-            nu = h2d_dist.reshape(h2d_dist.shape[0], 1, h2d_dist.shape[1]) - \
+            nu = -h2d_dist.reshape(h2d_dist.shape[0], 1, h2d_dist.shape[1]) + \
                  h2a_dist.reshape(h2a_dist.shape[0], h2a_dist.shape[1], 1)
             # first dimension for H, second dimension for acceptor, third for donor
             had_pairs = [(iH, iacceptor, idonor) 
