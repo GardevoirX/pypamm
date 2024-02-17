@@ -85,7 +85,7 @@ class HBPAMM:
                                      self.cell[iframe]) # r
             mu = h2d_dist.reshape(h2d_dist.shape[0], 1, h2d_dist.shape[1]) + \
                  h2a_dist.reshape(h2a_dist.shape[0], h2a_dist.shape[1], 1)
-            nu = h2d_dist.reshape(h2d_dist.shape[0], 1, h2d_dist.shape[1]) - \
+            nu = -h2d_dist.reshape(h2d_dist.shape[0], 1, h2d_dist.shape[1]) + \
                  h2a_dist.reshape(h2a_dist.shape[0], h2a_dist.shape[1], 1)
             # first dimension for H, second dimension for acceptor, third for donor
             had_pairs = [(iH, iacceptor, idonor) 
